@@ -18,6 +18,7 @@
 // each other.
 #include "bbhost/sdk.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -355,6 +356,78 @@ void on_message(const chan::Header& h, const std::uint8_t* body) {
     }
 }
 
+// ---- Version 12: the party on screen, and who ends a session -----------------
+// Banners for the room's events (on_session), a status line while in a party
+// (overlay_text), and BBHOST_SEAMLESS_TRACE=1: every BeginLeaveSession
+// (0x22d07a0) and SessionWorldTransition (0x17cde30) logged with the caller's
+// Binary Ninja address - which of the game's ways out ended a session.
+constexpr std::uint32_t kStatusText = 0x5ea10001;  // this plugin's overlay ids: 0x5ea1xxxx
+constexpr std::uint64_t kBeginLeaveSession = 0x22d07a0;
+const std::uint8_t kBeginLeavePrologue[17] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
+                                              0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x38};
+constexpr std::uint64_t kSessionWorldTransition = 0x17cde30;
+const std::uint8_t kWorldTransitionPrologue[14] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41,
+                                                   0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50};
+
+std::uint64_t caller_bn(const BbHookCtx* ctx) {
+    const std::uint64_t base = g.api->guest_addr(0x400000);
+    return base && ctx->ret_addr >= base ? ctx->ret_addr - base + 0x400000 : ctx->ret_addr;
+}
+
+int trace_hook(BbHookCtx* ctx, void* what) {
+    const chan::Session s = chan::session();
+    g.log("seamless: trace: %s from 0x%llx (role %d, session state %d)", static_cast<const char*>(what),
+          static_cast<unsigned long long>(caller_bn(ctx)), s.role, s.wsom ? chan::at<std::int32_t>(s.wsom, 0x84) : -1);
+    return 0;
+}
+
+std::string g_host_name;  // the host's online id, while a guest in a party
+int g_party = 0;          // other members in the room
+
+void on_session(const BbSessionEvent* ev, void*) {
+    const std::string who = ev->online_id && ev->online_id[0] ? ev->online_id : "A hunter";
+    switch (ev->kind) {
+    case BB_SESSION_CREATED:
+        g_party = 0;
+        break;
+    case BB_SESSION_JOINED:
+        g_party = 0;
+        break;
+    case BB_SESSION_MEMBER_JOINED:
+        ++g_party;
+        if (ev->member_id == ev->owner_member_id) g_host_name = who;
+        g.message(ev->member_id == ev->owner_member_id ? "You are in " + who + "'s world" : who + " joined the party");
+        break;
+    case BB_SESSION_MEMBER_LEFT:
+        if (g_party > 0) --g_party;
+        g.message(who + " left the party");
+        break;
+    case BB_SESSION_LEFT:
+    case BB_SESSION_CLOSED:
+    case BB_SESSION_KICKED:
+        if (g_party > 0) g.message("The party has ended");
+        g_party = 0;
+        g_host_name.clear();
+        break;
+    default:
+        break;
+    }
+}
+
+// The status line, refreshed each second while there is a party.
+void status_line() {
+    static std::uint32_t frame;
+    if (++frame % 60 != 0) return;
+    if (g_party <= 0) return;
+    const chan::Session s = chan::session();
+    char line[128];
+    if (s.host())
+        std::snprintf(line, sizeof line, "Seamless: your world, %d %s", g_party, g_party == 1 ? "guest" : "guests");
+    else
+        std::snprintf(line, sizeof line, "Seamless: in %s's world", g_host_name.empty() ? "the host" : g_host_name.c_str());
+    g.api->overlay_text(kStatusText, line, 0.01f, 0.01f, 0xd8c8a0ffu, 2.0f, 0);
+}
+
 void read_options() {
     g_free_bells = option("free_bells", true);
     g_anywhere = option("anywhere", true);
@@ -409,6 +482,7 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
             const int r = g.api->lamp_warp(rp);
             g.log("seamless: lamp travel to %d after the host: %s", rp, r == 0 ? "queued" : "refused");
         }
+        if (g.api->version >= 12) status_line();
         static std::uint32_t frame, pings;
         if (ping && ++frame % 120 == 0) {
             ++pings;
@@ -416,6 +490,18 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
             if (n) g.log("seamless: ping %u sent to %d", pings, n);
         }
     });
+    if (api->version >= 12) {
+        api->on_session(on_session, nullptr);
+        const char* t = std::getenv("BBHOST_SEAMLESS_TRACE");
+        if (t && t[0] == '1') {
+            if (api->hook2(kBeginLeaveSession, kBeginLeavePrologue, sizeof kBeginLeavePrologue, trace_hook,
+                           const_cast<char*>("BeginLeaveSession")) != 0)
+                g.log("seamless: trace: BeginLeaveSession has other bytes");
+            if (api->hook2(kSessionWorldTransition, kWorldTransitionPrologue, sizeof kWorldTransitionPrologue, trace_hook,
+                           const_cast<char*>("SessionWorldTransition")) != 0)
+                g.log("seamless: trace: SessionWorldTransition has other bytes");
+        }
+    }
     if (g_follow && api->hook2(kWarpBonfire, kWarpBonfirePrologue, sizeof kWarpBonfirePrologue, on_warp_bonfire, nullptr) != 0)
         g.log("seamless: the lamp travel at 0x%llx has other bytes; guests will not follow",
               static_cast<unsigned long long>(kWarpBonfire));
