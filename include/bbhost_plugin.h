@@ -173,6 +173,28 @@ typedef struct BbText {
 #define BB_TEXT_BOTTOM 4u  /* y is the bottom of the last line */
 #define BB_TEXT_NO_BOX 8u  /* no dark box behind the text */
 
+/* Version 12: what happened to the online session's room (on_session).
+ * The local player is one member of the room; the host made it and owns it. */
+#define BB_SESSION_CREATED 1        /* the local player made a room and hosts it */
+#define BB_SESSION_JOINED 2         /* the local player joined another's room as a guest */
+#define BB_SESSION_MEMBER_JOINED 3  /* another player is in the room */
+#define BB_SESSION_MEMBER_LEFT 4    /* another player left it, was sent away or timed out */
+#define BB_SESSION_LEFT 5           /* the local player left the room: the session is over */
+#define BB_SESSION_CLOSED 6         /* the room went: the host left, the server closed it */
+#define BB_SESSION_KICKED 7         /* the host sent the local player away */
+typedef struct BbSessionEvent {
+    uint32_t kind;             /* BB_SESSION_* */
+    uint32_t member_id;        /* the member it is about: the other player for MEMBER_*, else the local player */
+    uint64_t room_id;
+    uint32_t self_member_id;   /* the local player's member id in the room */
+    uint32_t owner_member_id;  /* the room owner's (the host's) member id */
+    int32_t is_owner;          /* 1 when the local player owns the room */
+    int32_t _pad;
+    const char* online_id;     /* member_id's online name ("" when unknown) */
+    const char* reason;        /* MEMBER_LEFT: the server's ("leave_room", "kicked", ...);
+                                  LEFT, CLOSED, KICKED: the host's log words; "" otherwise */
+} BbSessionEvent;
+
 typedef struct BbHostApi {
     uint32_t version; /* BB_PLUGIN_API_VERSION */
     uint32_t size;    /* sizeof(BbHostApi): a newer host may append fields */
@@ -400,6 +422,16 @@ typedef struct BbHostApi {
      * (docs/plugins.md). Any thread. 0 when shown; 1 for a bad argument or
      * when 256 are up. */
     int (*overlay_text)(uint32_t id, const char* text, float x, float y, uint32_t rgba, float seconds, uint32_t flags);
+    /* Version 12: the online session. */
+    /* fn(ev, user) for every change to the room the local player is in - a
+     * room made or joined, a member in or out, the session over - on the
+     * main thread at the next frame, oldest first (the NP layer hears them on
+     * its network thread; a plugin may touch game objects here). A guest's
+     * JOINED is followed by a MEMBER_JOINED for each player already in the
+     * room, in member order. ev and its strings are good for the call only.
+     * The game hears the same events on its own schedule: the world may not
+     * show the player yet. 0 on success. */
+    int (*on_session)(void (*fn)(const BbSessionEvent* ev, void* user), void* user);
 } BbHostApi;
 
 #ifdef __cplusplus

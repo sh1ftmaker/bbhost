@@ -199,6 +199,22 @@ only meet others with the same rules. `set_rules` updates the plugin's entry
 plugin flagged `BB_PLUGIN_ADOPTS_RULES` play by a host's rules when summoned
 into another player's modded world.
 
+**The online session** (v12)
+
+`on_session(fn, user)` tells a plugin what happens to the Matching2 room the
+player is in, as bbhost's NP layer sees it (the `np:` lines of the log): a
+room made (`BB_SESSION_CREATED`, a host) or joined (`BB_SESSION_JOINED`, a
+guest, followed by a `BB_SESSION_MEMBER_JOINED` for each player already
+there), a member in or out (`MEMBER_JOINED`, `MEMBER_LEFT` with the server's
+reason), and the end: `LEFT` (the player left), `CLOSED` (the room went: the
+host left, the server closed it) or `KICKED`. A `BbSessionEvent` names the
+room, the member it is about with their online name, the player's own member
+id, the owner's, and whether the player owns the room. The events arrive on
+the network thread and are delivered on the main thread at the next frame,
+oldest first, so a callback may touch game objects; the game hears the same
+events on its own schedule, so a member who just joined may not be in the
+world yet.
+
 ## The C++ SDK
 
 C++ plugins can use `include/bbhost/`:
