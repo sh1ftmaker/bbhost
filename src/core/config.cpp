@@ -142,6 +142,7 @@ void apply_values(const std::map<std::string, std::string>& kv, HostConfig* c) {
     num("online.playlog_upload_seconds", &c->playlog_upload_seconds);
     num("online.playlog_sample_ms", &c->playlog_sample_ms);
     num("online.sign_timeout_seconds", &c->sign_timeout_seconds);
+    num("online.summon_poll_seconds", &c->summon_poll_seconds);
     {
         auto it = kv.find("update.check");
         if (it != kv.end()) c->update_check = it->second == "true" || it->second == "1";

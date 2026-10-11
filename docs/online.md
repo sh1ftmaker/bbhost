@@ -54,6 +54,10 @@ is the in-game online name. F10 has the same account screen in game.
   current (`online.playlog_upload_seconds`).
 - **Shorter summon timeouts**: a summon sign that cannot be answered gives up
   after 30 seconds instead of three minutes (`online.sign_timeout_seconds`).
+- **Faster sign lists**: the game asks the server for the summon signs around
+  the player every minute; `online.summon_poll_seconds` makes it ask more
+  often, so a sign put down nearby shows sooner (off by default; at least 5
+  seconds; a server that sets the interval itself still decides).
 - **Modded worlds stay apart**: sessions with gameplay plugins (the
   randomizer, the boss rush, mutators) announce their rules to the server,
   which keeps their messages, bloodstains, signs and statistics separate from

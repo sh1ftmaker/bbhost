@@ -45,6 +45,10 @@ playlog_sample_ms = 500
 # How long, in seconds, the game waits on a summon sign the player touched
 # before giving up on it (engine/sos_signs.h). The game's own is 180; 0 keeps that.
 sign_timeout_seconds = 30
+# How often, in seconds, the game asks the server for summon signs where the
+# player stands (engine/sos_signs.h). The game's own is 60, unless the
+# server's status info sets it; 0 keeps that, and the least is 5.
+summon_poll_seconds = 0
 
 [player]
 # The character's name the name box starts from (the first key typed replaces
