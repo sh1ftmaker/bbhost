@@ -122,9 +122,10 @@ gives the Binary Ninja address.
 - `symbol(name)` (v8): the address of a named engine symbol from
   `bbhost/engine/symbols.hpp`.
 - `register_hle(name, fn)`: replaces bbhost's implementation of a PS4 system
-  function by its export name. Only from `bb_plugin_init`. The game calls `fn`
-  with the SysV ABI, so it must be declared `BB_GUEST_ABI` (Clang or GCC; not
-  possible with MSVC).
+  function by its export name. Only from `bb_plugin_init`; the replacement
+  holds once that returns 0, over bbhost's own and over an earlier plugin's
+  (the log names each). The game calls `fn` with the SysV ABI, so it must be
+  declared `BB_GUEST_ABI` (Clang or GCC; not possible with MSVC).
 
 **The engine's state**
 

@@ -181,7 +181,9 @@ typedef struct BbHostApi {
     const char* (*mods_dir)(void);
     /* Replaces the HLE implementation of a PS4 import (its exported name,
      * e.g. "sceKernelUsleep") with fn, a BB_GUEST_ABI function taking the
-     * import's own arguments. Only from bb_plugin_init. 0 on success. */
+     * import's own arguments. Only from bb_plugin_init; it takes effect when
+     * that returns 0, over bbhost's own and an earlier plugin's. 0 on
+     * success. */
     int (*register_hle)(const char* name, void* fn);
 
     /* From bb_plugin_image on. */

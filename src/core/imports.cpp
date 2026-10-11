@@ -20,6 +20,9 @@ namespace {
 std::unordered_map<std::string, std::string> g_nid_to_name;
 std::unordered_map<std::string, void*> g_hle;
 std::unordered_set<std::string> g_hle_raw;
+// Names a plugin replaced (register_hle_fn_plugin): bbhost's own registration,
+// which runs after the plugins' init, leaves them alone.
+std::unordered_set<std::string> g_hle_plugin;
 
 void ensure_nid_map() {
     if (!g_nid_to_name.empty()) {
@@ -30,15 +33,32 @@ void ensure_nid_map() {
     }
 }
 
+// Whether a plugin holds the name, said in the log the first time bbhost's
+// own implementation is set aside for it.
+bool plugin_holds(const char* name) {
+    if (!g_hle_plugin.count(name)) return false;
+    static std::unordered_set<std::string> said;
+    if (said.insert(name).second) host_log("hle: %s: a plugin's replaces bbhost's own", name);
+    return true;
+}
+
 }  // namespace
 
 void register_hle_fn(const char* name, void* fn) {
+    if (plugin_holds(name)) return;
     g_hle[name] = fn;
 }
 
 void register_hle_fn_raw(const char* name, void* fn) {
+    if (plugin_holds(name)) return;
     g_hle[name] = fn;
     g_hle_raw.insert(name);
+}
+
+void register_hle_fn_plugin(const char* name, void* fn) {
+    g_hle[name] = fn;
+    g_hle_raw.erase(name);  // a plugin's function is reached through the thunk
+    g_hle_plugin.insert(name);
 }
 
 std::string lookup_nid_name(std::string_view nid) {

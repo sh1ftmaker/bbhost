@@ -39,6 +39,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -63,6 +64,10 @@ struct Plugin {
 std::vector<Plugin> g_plugins;
 ElfImage* g_image = nullptr;
 bool g_early = true;  // register_hle allowed
+// The imports the plugin being initialised replaces: bound once its init
+// returns 0, dropped with it otherwise.
+std::vector<std::pair<std::string, void*>> g_init_hle;
+std::map<std::string, std::string> g_hle_owner;  // an import a plugin replaced -> that plugin
 bool g_in_image = false;  // the plugins' image phase: replace_text allowed
 std::string g_config_value;
 
@@ -122,8 +127,7 @@ const char* api_mods_dir() { return hle_fs_mods_root(); }
 
 int api_register_hle(const char* name, void* fn) {
     if (!g_early || !name || !fn) return 1;
-    register_hle_fn(name, fn);
-    host_log("plugin: %s replaced by a plugin", name);
+    g_init_hle.emplace_back(name, fn);
     return 0;
 }
 
@@ -955,12 +959,24 @@ void plugins_load() {
         }
 
         if (p.init) {
+            g_init_hle.clear();
             const int r = p.init(&g_api);
             if (r != 0) {
-                host_log("plugin: %s: init returned %d; unloaded", p.name.c_str(), r);
+                host_log("plugin: %s: init returned %d; unloaded%s", p.name.c_str(), r,
+                         g_init_hle.empty() ? "" : ", none of the imports it replaced bound");
                 close_lib(h);
                 continue;
             }
+            // bbhost registers its own imports after this (register_hle), and
+            // leaves these alone.
+            for (const auto& [import, fn] : g_init_hle) {
+                std::string& owner = g_hle_owner[import];
+                if (owner.empty() || owner == p.name) host_log("plugin: %s: %s replaced", p.name.c_str(), import.c_str());
+                else host_log("plugin: %s: %s replaced, over %s's", p.name.c_str(), import.c_str(), owner.c_str());
+                register_hle_fn_plugin(import.c_str(), fn);
+                owner = p.name;
+            }
+            g_init_hle.clear();
         }
         p.official = official;
         // A plugin the player turned on that says it changes the game (a boss
