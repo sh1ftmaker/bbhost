@@ -124,3 +124,37 @@ powershell -ExecutionPolicy Bypass -File pair.ps1 -Seamless -KeepRunning -Second
   - The lamp prompt for the host while in a session (shadp2p's +0x49 gate).
   - Travel to and from the Hunter's Dream.
 - **Next:** M2 (auto re-summon as a safety net), M3 (boss and host death in game), the Dream (M5/M5b), and the join UX with the new server features.
+
+## Update (2026-10-11, later): deaths, lamps, the Dream
+
+All of the following verified with two local instances:
+- **Two lamp travels in a row:** both sides rebuild each other's character each time. The rebuild now retries until the world is ready.
+- **Host death (`keep_on_death`):**
+  - The HostDead broadcast is NOPed (0x17816d7).
+  - In the host's respawn transition (caller 0x1781ee3) the host sends GameStateMan+0x1528 (its lamp), and guests follow.
+  - The host's death clears its task list, so `new_task()` builds one the way the game does on a join (0x1b8c217..).
+- **Guest death:**
+  - The OnGameLeave(4063) call at 0x178201b is NOPed.
+  - PartyGhostDeath_2's transition (caller 0x1782668) is redirected to the host's lamp (+0x0c/+0x10/+0x1528/+0x1524, +0x1520=0).
+  - Flags 4000/4047, the death state and the event state are cleared after the load, and PeerReloaded is sent.
+  - The guest's own respawn point is saved and restored around the party.
+  - Known issue: the host's copy of the guest's health bar may stay low.
+- **Host lamps (`host_lamps`):** talk function 52 is patched at 0x243c546 (members AND role != 3). In a party the host still uses lamps, headstones, the Doll and NPCs; guests keep the multiplayer branch.
+- **Real lamp and headstone travel** goes through WarpParam 0x17cdf30. It's hooked, and guests make the same call.
+  - Round trip Yharnam -> Dream (2102950) -> Yharnam (2412950): pass. Both end in map 18010000 with the room and each other's characters.
+  - Shared Dream screenshot: `runs/20261011-090142`.
+- **Robustness:**
+  - Travel messages go to every member.
+  - A 5 s repair check rebuilds any member without a character for 10 s.
+- **Runner:**
+  - New switches: `-Loads N`, `-WarpIds "2102950,2412950"`, `-KillHostAfter S`, `-KillGuestAfter S`.
+  - RESULT now prints the map.
+- **Still to do:**
+  - Boss kill in game (the patches exist).
+  - In the shared Dream the guest can't level or shop (M5b).
+  - The Hunter's Mark path (SetDefaultMapUid 0x1732bc0).
+  - Auto re-summon when the room really drops (M2).
+  - Join UX: password and invite with the test server.
+  - Invasions off in seamless.
+  - The guest health bar.
+  - Docs for the PR.
