@@ -44,7 +44,11 @@ void* thunk_wrap_capture_frame(void* fn);
 // argument registers; writing to them is how a hook rewrites an argument.
 // Without keep_rax the stub also keeps xmm0-7 (a float argument) across the
 // host call - saved - 136 is xmm0, 16 bytes each, rewritable the same way -
-// and saved[-1] is a slot, zero to start, that a skipped call returns.
+// and saved[-1] is a slot, zero to start, that a skipped call returns. Either
+// way the stub is reached as the function would be (a jump from its first
+// byte, a call or a tail jump), so above the pushes is the stack as it was
+// entered: saved[6] is the return address the call pushed, &saved[6] the
+// entry's rsp.
 std::uint8_t* thunk_emit_prologue_stub(std::uint8_t* code, std::uint64_t id, void* host, std::uint64_t resume,
                                       const std::uint8_t* displaced, std::size_t n, bool keep_rax = false);
 

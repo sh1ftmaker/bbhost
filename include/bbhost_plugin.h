@@ -1,4 +1,4 @@
-/* bbhost plugin API, version 10.
+/* bbhost plugin API, version 12.
  *
  * A plugin is a shared library (.so on Linux, .dll on Windows) in
  * <exe dir>/plugins or <data>/plugins. The host loads every one at start and
@@ -35,7 +35,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 11
+#define BB_PLUGIN_API_VERSION 12
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -63,6 +63,10 @@ typedef struct BbHookCtx {
     uint64_t arg[6];  /* rdi rsi rdx rcx r8 r9: the integer arguments, writable */
     uint64_t xmm[8];  /* the low 64 bits of xmm0-7 (a float in the low 32), writable */
     uint64_t ret;     /* what the caller gets when the hook skips the function (0 to start) */
+    /* Version 12: who called, as runtime addresses, read only. A host older
+     * than 12 passes the struct without them: check api->version first. */
+    uint64_t ret_addr; /* the return address the call pushed: the caller's next instruction */
+    uint64_t rsp;      /* the guest's rsp at entry, before the prologue: ret_addr's slot, the stack arguments above */
 } BbHookCtx;
 /* Returns nonzero to skip the function (its caller gets ctx->ret), zero to
  * run it with the arguments as ctx leaves them. */

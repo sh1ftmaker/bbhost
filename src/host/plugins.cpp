@@ -200,12 +200,15 @@ GUEST_ABI std::int64_t hook_dispatch(std::uint64_t id, const std::uint64_t* save
     if (h.fn2) {
         // The stub's frame (core/thunk.h): saved[0..5] = r9 r8 rcx rdx rsi
         // rdi, saved[-1] the return slot, xmm0-7 16 bytes apart 136 bytes
-        // below saved.
+        // below saved, and above the pushes the entry's own stack: saved[6]
+        // the return address, &saved[6] the rsp the function was entered with.
         auto* regs = const_cast<std::uint64_t*>(saved);
         auto* xmm = reinterpret_cast<std::uint8_t*>(regs) - 136;
         BbHookCtx c{};
         for (int i = 0; i < 6; ++i) c.arg[i] = regs[5 - i];
         for (int i = 0; i < 8; ++i) std::memcpy(&c.xmm[i], xmm + 16 * i, 8);
+        c.ret_addr = regs[6];
+        c.rsp = reinterpret_cast<std::uint64_t>(regs + 6);
         const int skip = h.fn2(&c, h.user);
         for (int i = 0; i < 6; ++i) regs[5 - i] = c.arg[i];
         for (int i = 0; i < 8; ++i) std::memcpy(xmm + 16 * i, &c.xmm[i], 8);

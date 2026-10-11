@@ -79,7 +79,7 @@ log line. Everything a plugin logs is prefixed with `plugin:`.
 
 The API only ever grows. A plugin checks that `api->version` is at least the
 version whose calls it makes, and `api->size` for fields a newer host
-appended. The current version is 10 (`BB_PLUGIN_API_VERSION`).
+appended. The current version is 12 (`BB_PLUGIN_API_VERSION`).
 
 ## Addresses
 
@@ -109,7 +109,13 @@ gives the Binary Ninja address.
   `prologue` is the function's first `n` bytes (at least 14, none of them
   rip-relative).
 - `hook2(...)` (v8): the same with a `BbHookCtx`: integer and float argument
-  registers, both writable, and the value a skipped call returns.
+  registers, both writable, and the value a skipped call returns. From v12 it
+  also says who called: `ret_addr`, the return address the call pushed, and
+  `rsp`, the stack pointer as the function was entered (before its prologue
+  runs; `rsp + 8` holds the 7th integer argument). Both are runtime addresses
+  and read only; `ret_addr - guest_addr(0x400000) + 0x400000` is the caller's
+  Binary Ninja address when it is in the image. A host older than 12 passes a
+  smaller `BbHookCtx`, so check `api->version` before reading them.
 - `call_guest(addr, regs)` (v8): calls a game function with up to six integer
   arguments, eight float registers and four stack arguments; returns rax and
   xmm0. Call it from the main thread.
