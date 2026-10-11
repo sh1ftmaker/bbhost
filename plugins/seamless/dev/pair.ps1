@@ -35,10 +35,10 @@ param(
     [string]$Python = "python",
     # Title (60 fps, intro skipped): any button, Down x4 to "Log In" (the
     # game starts offline; Log In fetches ss.info and logs in), then Continue.
-    [string]$TitlePress = "8:cross,11:down:150,12:down:150,13:down:150,14:down:150,15.5:cross:150,24:cross:150,40:cross:150,43:circle:150",
+    [string]$TitlePress = "8:cross,11:down:150,12:down:150,13:down:150,14:down:150,15.5:cross:150,24:cross:150",
     # Extra presses after the title, per role (BBHOST_AUTOPRESS syntax, appended).
     [string]$HostPress = "",
-    [string]$GuestPress = "",
+    [string]$GuestPress = "40:cross:150,43:circle:150",  # a second Continue for a slow title (in the world: a menu opened and closed)
     # BBHOST_NP_TEST per role: "<role>:<seconds after the world is up>".
     [string]$HostTest = "probe",
     [string]$GuestTest = "probe",
@@ -60,6 +60,7 @@ param(
     [int]$HoldAfterJoin = 15,            # without -ReloadAfter: stop this long after both report the join
     [double]$LampDelay = 2,              # seconds in the Dream before the lamp travel
     [int]$ReloadAfter = 0,                # both: lamp travel again this many s after the other player shows up
+    [int]$Loads = 1,                     # with -ReloadAfter: that many lamp travels in a row (COOP_LOADS)
     [switch]$Trace,                      # BBHOST_SEAMLESS_TRACE=1: log who calls BeginLeaveSession / SessionWorldTransition
     [switch]$Ping,                       # BBHOST_SEAMLESS_PING=1: the seamless plugin's channel test
     [switch]$HostOnlyReload,             # only the host reloads (-ReloadAfter); the guest follows it or not
@@ -161,7 +162,7 @@ $pluginToml
 $common = @{
     BBHOST_SETUP_WINDOW = "0"; BBHOST_SKIP_INTRO = "1"; BBHOST_PRESENT_MODE = "fifo";
     BBHOST_NP_TRACE = "1"; BBHOST_TEST_INSIGHT = "$Insight"; BBHOST_GAME_FPS = "60";
-    BBHOST_TEST_WARP = "1"; BBHOST_TEST_UNLOCK_LAMPS = "1"; COOP_LAMP_RP = "$LampRp"; COOP_RELOAD_AFTER = "$ReloadAfter"; COOP_LAMP_DELAY = "$LampDelay"; BBHOST_SEAMLESS_PING = $(if ($Ping) { "1" } else { "0" }); BBHOST_SEAMLESS_TRACE = $(if ($Trace) { "1" } else { "0" })
+    BBHOST_TEST_WARP = "1"; BBHOST_TEST_UNLOCK_LAMPS = "1"; COOP_LAMP_RP = "$LampRp"; COOP_RELOAD_AFTER = "$ReloadAfter"; COOP_LOADS = "$Loads"; COOP_LAMP_DELAY = "$LampDelay"; BBHOST_SEAMLESS_PING = $(if ($Ping) { "1" } else { "0" }); BBHOST_SEAMLESS_TRACE = $(if ($Trace) { "1" } else { "0" })
 }
 
 function Start-Instance($inst, [hashtable]$envs) {

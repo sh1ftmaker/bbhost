@@ -50,6 +50,7 @@ static char g_effects[1024];
 static int g_goods_logged = 0;
 static double g_reload_after = 0, g_others_since = 0, g_reload_at = 0;
 static int g_reload_done = 0, g_others = -1, g_result_done = 0;
+static int g_loads = 0, g_expect = 1, g_host_reloads = 0; /* loads since the join; how many to make/expect */
 static char g_gate[512];
 static double g_hold = 75;
 static char g_session[64];
@@ -132,10 +133,11 @@ static void on_frame(void* user) {
             g_world_since = t;
             /* A load after another member was here (this side's reload, or
              * following the host's): watch whether the session is still on. */
-            if (g_others_since && !g_reload_done) {
+            if (g_others_since) {
                 g_reload_done = 1;
                 g_reload_at = t;
-                api->log("coop_lamp: a load with the session on; watching it");
+                ++g_loads;
+                api->log("coop_lamp: load %d with the session on; watching it", g_loads);
             }
             api->log("coop_lamp: in block %08x", (unsigned)block);
             if (!g_goods_logged) {
@@ -151,7 +153,13 @@ static void on_frame(void* user) {
             int role = 0;
             const int members = session_members(&role);
             char sess[64];
-            snprintf(sess, sizeof sess, "role %d, %d members", role, members);
+            int wstate = -1;
+            {
+                const uint64_t ws = api->guest_addr(0x593d6d0);
+                const uint8_t* w = ws ? *(uint8_t* const*)(uintptr_t)ws : 0;
+                if (w) wstate = *(const int32_t*)(w + 0x84);
+            }
+            snprintf(sess, sizeof sess, "role %d, %d members, world session state %d", role, members, wstate);
             if (strcmp(sess, g_session) != 0) {
                 api->log("coop_lamp: session: %s (block %08x)", sess, (unsigned)block);
                 strcpy(g_session, sess);
@@ -163,11 +171,11 @@ static void on_frame(void* user) {
                 g_result_done = 1;
                 api->log("coop_lamp: RESULT the session did not survive the load: %s, %.0f s after it", sess, t - g_reload_at);
             }
-            if (g_reload_done && !g_result_done && t - g_reload_at > g_hold) {
+            if (g_reload_done && g_loads >= g_expect && !g_result_done && t - g_reload_at > g_hold) {
                 if (members >= 2) {
                     g_result_done = 1;
-                    api->log("coop_lamp: RESULT the session survived the load: %s, %.0f s after the reload", sess,
-                             t - g_reload_at);
+                    api->log("coop_lamp: RESULT the session survived %d load%s: %s, %.0f s after the last", g_loads,
+                             g_loads == 1 ? "" : "s", sess, t - g_reload_at);
                 }
             }
             const int others = members > 1 ? members - 1 : 0;
@@ -176,9 +184,9 @@ static void on_frame(void* user) {
                 g_others = others;
             }
             if (others > 0 && !g_others_since) g_others_since = t;
-            if (g_reload_after > 0 && !g_reload_done && g_others_since && t - g_others_since >= g_reload_after) {
-                g_reload_done = 1;
-                g_reload_at = t;
+            if (g_reload_after > 0 && g_host_reloads < g_expect && g_others_since && others > 0 &&
+                t - (g_reload_at ? g_reload_at : g_others_since) >= g_reload_after + (g_host_reloads ? 20 : 0)) {
+                ++g_host_reloads;
                 int r = api->lamp_warp(g_rp);
                 api->log("coop_lamp: reload: lamp_warp(%d) with %d other players -> %s", (int)g_rp, others,
                          r == 0 ? "queued" : "refused");
@@ -231,6 +239,7 @@ BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* a) {
     if ((e = getenv("COOP_BELL_SPEFFECT")) && *e) g_bell_sp = atoi(e);
     if ((e = getenv("COOP_BELL_AT")) && *e) g_bell_at = atof(e);
     if ((e = getenv("COOP_RELOAD_AFTER")) && *e) g_reload_after = atof(e);
+    if ((e = getenv("COOP_LOADS")) && *e) g_expect = atoi(e);
     if ((e = getenv("COOP_HOLD")) && *e) g_hold = atof(e);
     if ((e = getenv("COOP_BELL_GATE")) && *e) snprintf(g_gate, sizeof g_gate, "%s", e);
     a->on_frame(on_frame, 0);

@@ -472,7 +472,8 @@ const std::uint8_t kDestroyAllTasksPrologue[14] = {0x55, 0x48, 0x89, 0xe5, 0x41,
 constexpr std::uint64_t kDestroyAllTasksFromUnload = 0x1d4720c;
 constexpr std::uint64_t kMultiPlayManPtr = 0x5940230;
 constexpr int kTaskStepUpdate = 6, kTaskStepCreate = 4;
-int g_reinsert_wait = 0;  // frames until the kept tasks are sent back to Create (0: nothing to do)
+int g_reinsert_wait = 0;   // frames until the kept tasks are sent back to Create (0: nothing to do)
+int g_reinsert_tries = 0;  // seconds of retries left while the world is not ready for it
 
 int on_destroy_all_tasks(BbHookCtx* ctx, void*) {
     const std::uint64_t base = g.api->guest_addr(0x400000);
@@ -480,17 +481,26 @@ int on_destroy_all_tasks(BbHookCtx* ctx, void*) {
     const chan::Session s = chan::session();
     if (from != kDestroyAllTasksFromUnload || !s.ready()) return 0;
     g_reinsert_wait = 600;  // ten seconds after the load starts
+    g_reinsert_tries = 60;
     g.log("seamless: a load in the session: the other players' tasks are kept");
     return 1;
 }
 
 // The kept tasks whose player has no character here, back to Create
 // (flags +0xed: 0x01 create requested, 0x04 member ready, 0x08 first sync).
-void reinsert() {
+// False while the world is not ready for it yet.
+bool reinsert() {
     const chan::Session s = chan::session();
     std::uint8_t* wcm = chan::deref(chan::kWorldChrManPtr);
     std::uint8_t* mpm = chan::deref(kMultiPlayManPtr);
-    if (!s.ready() || !wcm || !chan::at<std::uint8_t*>(wcm, 0x60) || !mpm) return;
+    const char* why = !s.ready() ? "the session is not synced"
+                      : !wcm || !chan::at<std::uint8_t*>(wcm, 0x60) ? "no player in the world"
+                      : !mpm ? "no CSMultiPlayMan"
+                             : nullptr;
+    if (why) {
+        if (g_reinsert_tries % 10 == 0) g.log("seamless: after the load: waiting (%s)", why);
+        return false;
+    }
     std::uint8_t** it = chan::at<std::uint8_t**>(mpm, 0x10);
     std::uint8_t** end = chan::at<std::uint8_t**>(mpm, 0x18);
     int sent = 0;
@@ -509,6 +519,7 @@ void reinsert() {
         }
     });
     g.log("seamless: after the load: %d character%s to make again", sent, sent == 1 ? "" : "s");
+    return true;
 }
 
 void read_options() {
@@ -563,7 +574,8 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
             g_keep_room = nullptr;
         }
         if (g_following > 0) --g_following;
-        if (g_reinsert_wait > 0 && --g_reinsert_wait == 0) reinsert();
+        if (g_reinsert_wait > 0 && --g_reinsert_wait == 0 && !reinsert() && --g_reinsert_tries > 0)
+            g_reinsert_wait = 60;  // again in a second
         chan::poll(on_message);
         if (g_follow_to) {
             const std::int32_t rp = g_follow_to;
