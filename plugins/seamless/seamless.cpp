@@ -12,6 +12,7 @@
 //   stay_after_boss = true # cooperators stay when the boss dies
 //   keep_on_load = true    # the room outlives a map load instead of ending with it
 //   follow_host = true     # guests travel to the lamp the host travels to
+//   host_lamps = true      # in a party the host still uses lamps, headstones and the Doll
 //   keep_on_death = true   # the host's death sends the guests to its lamp, not home
 //
 // Every player in a session needs it: it announces itself in the session's
@@ -41,6 +42,7 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
     {BB_OPT_BOOL, "stay_after_boss", "Stay after a boss", "Cooperators stay in the host's world when the boss dies.", "true"},
     {BB_OPT_BOOL, "keep_on_load", "Keep the session through loads", "A map load no longer ends the session.", "true"},
     {BB_OPT_BOOL, "follow_host", "Follow the host", "When the host travels to a lamp, the guests travel there too.", "true"},
+    {BB_OPT_BOOL, "host_lamps", "The host keeps its lamps", "In a party the host can still travel from lamps and headstones, level up and talk; the guests follow.", "true"},
     {BB_OPT_BOOL, "keep_on_death", "Keep the party when the host dies", "The guests travel to the host's lamp instead of going home.", "true"},
     {BB_OPT_END}};
 
@@ -56,6 +58,7 @@ bool g_stay_after_boss = true;
 bool g_keep_on_load = true;
 bool g_follow = true;
 bool g_keep_on_death = true;
+bool g_host_lamps = true;
 
 bool option(const char* key, bool def) {
     const std::string v = g.api->config((std::string("seamless.") + key).c_str());
@@ -159,6 +162,20 @@ const std::vector<Patch> kGuestDeath = {
     {"guest left on death", 0x178201b, {0x48, 0x89, 0xdf}, {0xe8, 0x20, 0xcd, 0xfa, 0xff}, {0x0f, 0x1f, 0x44, 0x00, 0x00}},
 };
 
+// In a party the host's lamps go dark: every lamp's, headstone's and NPC's
+// talk script branches on talk function 52, "multiplayer" (0x243ad60, case
+// at 0x243c546) - true when the net flow has more than one slot or the
+// session has members - and the multiplayer branch has no travel. Here it is
+// "members, and not the host" (SprjSessionManager +0x124 != 3): the host
+// talks and travels as alone, the guests as before.
+const std::vector<Patch> kHostLamps = {
+    {"multiplayer talk function", 0x243c546, {0x49, 0x8b, 0x06},
+     {0x48, 0x8b, 0x88, 0x00, 0x01, 0x00, 0x00, 0x48, 0x2b, 0x88, 0xf8, 0x00, 0x00, 0x00, 0x48, 0xc1, 0xe9, 0x05,
+      0x83, 0x7b, 0x14, 0x01, 0x0f, 0x9f, 0xc0, 0x85, 0xc9, 0x0f, 0x9f, 0xc1, 0x08, 0xc1, 0x0f, 0xb6, 0xc1},
+     {0x48, 0x8b, 0x88, 0x00, 0x01, 0x00, 0x00, 0x48, 0x3b, 0x88, 0xf8, 0x00, 0x00, 0x00, 0x0f, 0x95, 0xc1,
+      0x83, 0xb8, 0x24, 0x01, 0x00, 0x00, 0x03, 0x0f, 0x95, 0xc0, 0x20, 0xc8, 0x0f, 0xb6, 0xc0, 0x90, 0x90, 0x90}},
+};
+
 // A map load ends the session: the per-area event payload's destructor
 // (0x1d470f0) calls SprjSessionManager's BeginLeaveSession (0x22d07a0,
 // reason 0xff000023). In its place it calls the manager's "a matching
@@ -219,7 +236,7 @@ constexpr std::uint32_t kType = 0x1a;
 constexpr std::uint32_t kMagic = 0x434d4c53;  // "SLMC"
 constexpr std::size_t kMax = 0x400;
 
-enum Kind : std::uint8_t { Ping = 1, HostLampTravel = 2, HostRespawn = 3, HostReturnPoint = 4, PeerReloaded = 5 };
+enum Kind : std::uint8_t { Ping = 1, HostLampTravel = 2, HostRespawn = 3, HostReturnPoint = 4, PeerReloaded = 5, HostWarp = 6 };
 
 #pragma pack(push, 1)
 struct Header {
@@ -349,6 +366,7 @@ constexpr std::uint64_t kWarpBonfire = 0x172e050;
 const std::uint8_t kWarpBonfirePrologue[14] = {0x55, 0x48, 0x89, 0xe5, 0x48, 0x63, 0xc6,
                                                0x48, 0x69, 0xc8, 0x89, 0xb5, 0xf8, 0x14};
 std::int32_t g_follow_to = 0;  // a lamp the host went to, for this guest to follow
+std::int32_t g_follow_warp = 0;  // a WarpParam travel the host made (the Dream, a headstone), to follow
 int g_reinsert_wait = 0;   // frames until the kept tasks are sent back to Create (0: nothing to do)
 int g_reinsert_tries = 0;  // seconds of retries left while the world is not ready for it
 std::int32_t g_host_rp = 0, g_host_rp_anim = 0;  // the host's lamp (its respawn point), as a guest knows it
@@ -367,11 +385,29 @@ constexpr std::uint64_t kGameStateManPtr = 0x5956678;
 std::uint8_t* g_keep_room = nullptr;  // the byte while set for a follow
 std::uint8_t g_keep_room_was = 0;
 
+// Lamps and headstones travel through the event script's "warp to respawn
+// point" (EMEVD 2003[49]): 0x17cdf30, by WarpParam row (2102950.. the
+// Dream's arrivals, 2412950.. Central Yharnam's lamps). The host's goes to
+// the guests, who make the same call.
+constexpr std::uint64_t kWarpByParam = 0x17cdf30;
+const std::uint8_t kWarpByParamPrologue[15] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
+                                               0x53, 0x48, 0x83, 0xec, 0x38, 0x89, 0xfb};
+
+int on_warp_by_param(BbHookCtx* ctx, void*) {
+    const auto id = static_cast<std::int32_t>(ctx->arg[0]);
+    const chan::Session s = chan::session();
+    if (s.ready() && s.host()) {
+        const int n = chan::send_all(chan::HostWarp, &id, sizeof id, true);
+        g.log("seamless: the host travels (WarpParam %d); told %d guest%s", id, n, n == 1 ? "" : "s");
+    }
+    return 0;
+}
+
 int on_warp_bonfire(BbHookCtx* ctx, void*) {
     const auto rp = static_cast<std::int32_t>(ctx->arg[1]);
     const chan::Session s = chan::session();
     if (s.ready() && s.host()) {
-        const int n = chan::send_all(chan::HostLampTravel, &rp, sizeof rp);
+        const int n = chan::send_all(chan::HostLampTravel, &rp, sizeof rp, true);
         g.log("seamless: the host travels to lamp %d; told %d guest%s", rp, n, n == 1 ? "" : "s");
     }
     return 0;
@@ -397,6 +433,13 @@ void on_message(const chan::Header& h, const std::uint8_t* body) {
         g_reinsert_wait = 300;
         g_reinsert_tries = 60;
         g.log("seamless: player %d loaded again; making its character again", h.sender_no);
+        break;
+    case chan::HostWarp:
+        if (g_follow && h.body_size >= sizeof g_follow_warp && !chan::session().host()) {
+            std::memcpy(&g_follow_warp, body, sizeof g_follow_warp);
+            g.message((g_host_name.empty() ? std::string("The host") : g_host_name) + " travels - following");
+            g.log("seamless: the host travels (WarpParam %d); following", g_follow_warp);
+        }
         break;
     case chan::HostRespawn:
         if (g_keep_on_death && h.body_size >= sizeof g_follow_to && !chan::session().host()) {
@@ -446,7 +489,7 @@ int on_world_transition(BbHookCtx* ctx, void*) {
     if (g_keep_on_death && s.ready() && s.host() && caller_bn(ctx) == kFromHostDeathRespawn) {
         if (std::uint8_t* gsm = chan::deref(kGameStateManPtr)) {
             const std::int32_t rp = chan::at<std::int32_t>(gsm, 0x1528);
-            const int n = chan::send_all(chan::HostRespawn, &rp, sizeof rp);
+            const int n = chan::send_all(chan::HostRespawn, &rp, sizeof rp, true);
             g.log("seamless: the host died; it respawns at lamp %d (keeps the room: %d); told %d guest%s", rp,
                   chan::at<std::uint8_t>(gsm, 0x1592), n, n == 1 ? "" : "s");
         }
@@ -512,7 +555,7 @@ void guest_death_frame() {
     std::uint8_t* gsm = chan::deref(kGameStateManPtr);
     if (s.ready() && s.host() && gsm && frame % 300 == 0) {
         const std::int32_t rp[2] = {chan::at<std::int32_t>(gsm, 0x1528), chan::at<std::int32_t>(gsm, 0x152c)};
-        chan::send_all(chan::HostReturnPoint, rp, sizeof rp);
+        chan::send_all(chan::HostReturnPoint, rp, sizeof rp, true);
     }
     if (s.ready() && s.role == 6 && frame % 60 == 0 && !g_guest_respawn) {
         std::int64_t hp = 0;
@@ -684,6 +727,33 @@ bool reinsert() {
     return true;
 }
 
+// Every five seconds, outside a load: a member of the room without a
+// character here for ten seconds - a summon whose character was never made
+// on this side, one lost some other way - gets its task sent back to Create
+// (or a new one), as after a load. A task still on its way (joining) is left
+// alone.
+void repair_frame() {
+    static std::uint32_t frame;
+    static int missing_checks;
+    if (++frame % 300 != 0) return;
+    const chan::Session s = chan::session();
+    if (!s.ready() || g_reinsert_wait > 0 || g_following > 0) {
+        missing_checks = 0;
+        return;
+    }
+    int missing = 0;
+    chan::for_each_peer(s, [&](std::uint8_t* route) {
+        if (!chan::player_of(route)) ++missing;
+    });
+    missing_checks = missing ? missing_checks + 1 : 0;
+    if (missing_checks >= 2) {
+        g.log("seamless: %d member%s without a character here for 10 s; making %s again", missing, missing == 1 ? "" : "s",
+              missing == 1 ? "it" : "them");
+        missing_checks = 0;
+        reinsert();
+    }
+}
+
 void read_options() {
     g_free_bells = option("free_bells", true);
     g_anywhere = option("anywhere", true);
@@ -691,6 +761,7 @@ void read_options() {
     g_keep_on_load = option("keep_on_load", true);
     g_follow = option("follow_host", true);
     g_keep_on_death = option("keep_on_death", true);
+    g_host_lamps = option("host_lamps", true);
 }
 
 }  // namespace
@@ -713,6 +784,7 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
     if (g_stay_after_boss) apply("stay after a boss", kStayAfterBoss);
     if (g_keep_on_load) apply("keep the session through loads", kKeepOnLoad);
     if (g_keep_on_death) apply("keep the party when the host dies", kHostDeath);
+    if (g_host_lamps) apply("the host keeps its lamps", kHostLamps);
     if (g_keep_on_death && api->version >= 12) apply("keep the party when a guest dies", kGuestDeath);
     // The Beckoning Bell's Insight is its goods row's consumeHeroPoint (the
     // Souls games' humanity): 0 once the table has loaded.
@@ -740,9 +812,19 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
         }
         if (g_following > 0) --g_following;
         guest_death_frame();
+        repair_frame();
         if (g_reinsert_wait > 0 && --g_reinsert_wait == 0 && !reinsert() && --g_reinsert_tries > 0)
             g_reinsert_wait = 60;  // again in a second
         chan::poll(on_message);
+        if (g_follow_warp) {
+            const std::int32_t id = g_follow_warp;
+            g_follow_warp = 0;
+            g_following = 300;
+            BbCallRegs r{};
+            r.arg[0] = static_cast<std::uint64_t>(static_cast<std::uint32_t>(id));
+            const int rc = g.api->call_guest(kWarpByParam, &r);
+            g.log("seamless: travel (WarpParam %d) after the host: %s", id, rc == 0 ? "made" : "failed");
+        }
         if (g_follow_to) {
             const std::int32_t rp = g_follow_to;
             g_follow_to = 0;
@@ -792,6 +874,9 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
                                             on_world_transition, nullptr) != 0)
         g.log("seamless: the world transition at 0x%llx has other bytes; a following guest leaves the room",
               static_cast<unsigned long long>(kSessionWorldTransition));
+    if (g_follow && api->hook2(kWarpByParam, kWarpByParamPrologue, sizeof kWarpByParamPrologue, on_warp_by_param, nullptr) != 0)
+        g.log("seamless: the lamp and headstone travel at 0x%llx has other bytes; guests will not follow it",
+              static_cast<unsigned long long>(kWarpByParam));
     if (g_follow && api->hook2(kWarpBonfire, kWarpBonfirePrologue, sizeof kWarpBonfirePrologue, on_warp_bonfire, nullptr) != 0)
         g.log("seamless: the lamp travel at 0x%llx has other bytes; guests will not follow",
               static_cast<unsigned long long>(kWarpBonfire));

@@ -61,6 +61,7 @@ param(
     [double]$LampDelay = 2,              # seconds in the Dream before the lamp travel
     [int]$ReloadAfter = 0,                # both: lamp travel again this many s after the other player shows up
     [int]$Loads = 1,                     # with -ReloadAfter: that many lamp travels in a row (COOP_LOADS)
+    [string]$WarpIds = "",               # the host's reloads travel by these WarpParam rows ("2102950,2412950": the Dream, then back)
     [int]$KillHostAfter = 0,             # the host dies (SpEffect 4014) this many s after the party forms
     [int]$KillGuestAfter = 0,            # the guest dies likewise
     [switch]$Trace,                      # BBHOST_SEAMLESS_TRACE=1: log who calls BeginLeaveSession / SessionWorldTransition
@@ -249,7 +250,7 @@ if ($Only -ne "guest") {
     $h = New-Instance "host" "HostHunter" 9307
     $hp = Start-Instance $h @{ BBHOST_NP_TEST = $HostTest; BBHOST_AUTOPRESS = (Press $HostPress);
         COOP_BELL = "$HostBell"; COOP_BELL_AT = "$HostBellAt"; COOP_BELL_GATE = (Join-Path $Run "guest-sign");
-        COOP_KILL_AFTER = "$KillHostAfter" }
+        COOP_KILL_AFTER = "$KillHostAfter"; COOP_WARP_IDS = $WarpIds }
     $procs += $hp
     Wait-Healthy $h $hp
 }

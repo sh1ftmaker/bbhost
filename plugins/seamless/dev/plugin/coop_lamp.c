@@ -53,6 +53,8 @@ static int g_reload_done = 0, g_others = -1, g_result_done = 0;
 static int g_loads = 0, g_expect = 1, g_host_reloads = 0; /* loads since the join; how many to make/expect */
 static char g_gate[512];
 static double g_hold = 75;
+static int32_t g_warp_ids[8];
+static int g_warp_count = 0; /* COOP_WARP_IDS: the reloads travel by WarpParam (0x17cdf30) instead of lamp_warp */
 static double g_kill_after = 0; /* COOP_KILL_AFTER: kill the player that long after the party forms */
 static int g_kill_sp = 4014, g_killed = 0;
 static char g_session[64];
@@ -129,7 +131,7 @@ static void on_frame(void* user) {
         g_others = -1;
         return;
     }
-    if ((block >> 24) != 0x15) { /* a world outside the Hunter's Dream */
+    if ((block >> 24) != 0x15 || g_others_since) { /* a world outside the Hunter's Dream, or any once in a party */
         g_in_dream_since = 0;
         if (!g_world_since) {
             g_world_since = t;
@@ -176,8 +178,8 @@ static void on_frame(void* user) {
             if (g_reload_done && g_loads >= g_expect && !g_result_done && t - g_reload_at > g_hold) {
                 if (members >= 2) {
                     g_result_done = 1;
-                    api->log("coop_lamp: RESULT the session survived %d load%s: %s, %.0f s after the last", g_loads,
-                             g_loads == 1 ? "" : "s", sess, t - g_reload_at);
+                    api->log("coop_lamp: RESULT the session survived %d load%s: %s, map %08x, %.0f s after the last", g_loads,
+                             g_loads == 1 ? "" : "s", sess, (unsigned)block, t - g_reload_at);
                 }
             }
             const int others = members > 1 ? members - 1 : 0;
@@ -195,9 +197,19 @@ static void on_frame(void* user) {
             if (g_reload_after > 0 && g_host_reloads < g_expect && g_others_since && others > 0 &&
                 t - (g_reload_at ? g_reload_at : g_others_since) >= g_reload_after + (g_host_reloads ? 20 : 0)) {
                 ++g_host_reloads;
-                int r = api->lamp_warp(g_rp);
-                api->log("coop_lamp: reload: lamp_warp(%d) with %d other players -> %s", (int)g_rp, others,
-                         r == 0 ? "queued" : "refused");
+                int r;
+                if (g_warp_count >= g_host_reloads) {
+                    BbCallRegs regs;
+                    memset(&regs, 0, sizeof regs);
+                    regs.arg[0] = (uint32_t)g_warp_ids[g_host_reloads - 1];
+                    r = api->call_guest(0x17cdf30, &regs);
+                    api->log("coop_lamp: reload: travel by WarpParam %d -> %s", (int)g_warp_ids[g_host_reloads - 1],
+                             r == 0 ? "made" : "failed");
+                } else {
+                    r = api->lamp_warp(g_rp);
+                    api->log("coop_lamp: reload: lamp_warp(%d) with %d other players -> %s", (int)g_rp, others,
+                             r == 0 ? "queued" : "refused");
+                }
             }
             else if (!g_effects[0]) { api->log("coop_lamp: no player in chr_list yet"); strcpy(g_effects, "?"); }
         }
@@ -249,6 +261,13 @@ BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* a) {
     if ((e = getenv("COOP_RELOAD_AFTER")) && *e) g_reload_after = atof(e);
     if ((e = getenv("COOP_LOADS")) && *e) g_expect = atoi(e);
     if ((e = getenv("COOP_KILL_AFTER")) && *e) g_kill_after = atof(e);
+    if ((e = getenv("COOP_WARP_IDS")) && *e) {
+        const char* c = e;
+        while (*c && g_warp_count < 8) {
+            g_warp_ids[g_warp_count++] = (int32_t)strtol(c, (char**)&c, 10);
+            while (*c == ',') ++c;
+        }
+    }
     if ((e = getenv("COOP_KILL_SPEFFECT")) && *e) g_kill_sp = atoi(e);
     if ((e = getenv("COOP_HOLD")) && *e) g_hold = atof(e);
     if ((e = getenv("COOP_BELL_GATE")) && *e) snprintf(g_gate, sizeof g_gate, "%s", e);
