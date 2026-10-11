@@ -17,6 +17,11 @@ void plugins_frame();
 // A flag change for the callbacks registered with on_event_flag, from the
 // same hook (engine/event_flags.cpp).
 void plugins_event_flag(unsigned id, bool value);
+// A room event (BB_SESSION_*) for the callbacks registered with on_session,
+// from the NP layer's threads (hle/np_matching2.cpp): queued for the main
+// thread's next frame.
+void plugins_session_event(unsigned kind, unsigned long long room, unsigned member, const char* online_id,
+                           unsigned self, unsigned owner, const char* reason);
 
 // --- the plugin manager (host/plugin_ui.cpp) -------------------------------
 

@@ -778,6 +778,27 @@ int api_on_world_rules(const char* name, void (*fn)(const char*, void*), void* u
     return 0;
 }
 
+// Version 12: the session's room events, from the NP layer's threads, held
+// for the main thread's next frame - only while someone listens.
+struct SessionCallback {
+    void (*fn)(const BbSessionEvent*, void*);
+    void* user;
+};
+struct SessionEvent {
+    std::uint32_t kind, member, self, owner;
+    std::uint64_t room;
+    std::string online_id, reason;
+};
+std::vector<SessionCallback> g_session_callbacks;  // under g_frame_mu
+std::vector<SessionEvent> g_session_events;        // under g_frame_mu
+
+int api_on_session(void (*fn)(const BbSessionEvent*, void*), void* user) {
+    if (!fn) return 1;
+    std::lock_guard<std::mutex> lk(g_frame_mu);
+    g_session_callbacks.push_back({fn, user});
+    return 0;
+}
+
 const BbHostApi g_api = {
     BB_PLUGIN_API_VERSION, sizeof(BbHostApi), &api_log, &api_config, &api_data_dir, &api_mods_dir, &api_register_hle,
     &api_eboot_sha256, &api_eboot_is_109, &api_guest_addr, &api_read, &api_write, &api_patch, &api_hook,
@@ -790,6 +811,7 @@ const BbHostApi g_api = {
     &api_on_option, &api_on_action, &api_game_file, &api_overlay_file,
     &api_set_rules, &api_on_world_rules, &api_visitor,
     &api_replace_text,
+    &api_on_session,
 };
 
 std::string read_file(const std::string& path) {
@@ -1011,6 +1033,8 @@ void plugins_frame() {
     std::vector<MenuRequest> requests;
     std::vector<OptionCallback> options;
     std::vector<ActionCallback> actions;
+    std::vector<SessionEvent> sessions;
+    std::vector<SessionCallback> session_calls;
     {
         std::lock_guard<std::mutex> lk(g_frame_mu);
         requests.swap(g_menu_requests);
@@ -1018,7 +1042,9 @@ void plugins_frame() {
             options = g_option_callbacks;
             actions = g_action_callbacks;
         }
-        if (g_frame_callbacks.empty() && g_world_callbacks.empty() && requests.empty()) return;
+        sessions.swap(g_session_events);
+        if (!sessions.empty()) session_calls = g_session_callbacks;
+        if (g_frame_callbacks.empty() && g_world_callbacks.empty() && requests.empty() && sessions.empty()) return;
         now = g_frame_callbacks;
         loads = g_world_callbacks;
     }
@@ -1036,6 +1062,18 @@ void plugins_frame() {
         for (const OptionCallback& c : options) {
             if (c.name == r.name) c.fn(r.key.c_str(), r.value.c_str(), c.user);
         }
+    }
+    for (const SessionEvent& e : sessions) {
+        BbSessionEvent ev{};
+        ev.kind = e.kind;
+        ev.member_id = e.member;
+        ev.room_id = e.room;
+        ev.self_member_id = e.self;
+        ev.owner_member_id = e.owner;
+        ev.is_owner = e.self == e.owner ? 1 : 0;
+        ev.online_id = e.online_id.c_str();
+        ev.reason = e.reason.c_str();
+        for (const SessionCallback& c : session_calls) c.fn(&ev, c.user);
     }
     if (!loads.empty()) {
         // A world load is a new main player (every load builds one) or the
@@ -1062,6 +1100,16 @@ void plugins_event_flag(unsigned id, bool value) {
         now = g_flag_callbacks;
     }
     for (const FlagCallback& c : now) c.fn(id, value ? 1 : 0, c.user);
+}
+
+void plugins_session_event(unsigned kind, unsigned long long room, unsigned member, const char* online_id,
+                           unsigned self, unsigned owner, const char* reason) {
+    std::lock_guard<std::mutex> lk(g_frame_mu);
+    if (g_session_callbacks.empty()) return;
+    // A main thread that stopped running frames (a hang, the window closing)
+    // keeps the last ones; a session's worth is a few dozen.
+    if (g_session_events.size() >= 256) g_session_events.erase(g_session_events.begin());
+    g_session_events.push_back({kind, member, self, owner, room, online_id ? online_id : "", reason ? reason : ""});
 }
 
 // --- the plugin manager -----------------------------------------------------

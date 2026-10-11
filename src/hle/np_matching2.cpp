@@ -9,6 +9,7 @@
 // member record at data[0]). Timings and order are the co-op contract.
 #include "hle/np.h"
 
+#include "bbhost_plugin.h"
 #include "core/config.h"
 #include "core/thunk.h"
 #include "engine/summon_invite.h"
@@ -398,6 +399,13 @@ RoomUpdateInfo* build_room_update(std::uint8_t cause, const std::uint8_t* opt, s
     return info;
 }
 
+// The room as the plugins see it (on_session): a change, with the room's ids
+// as they are now. Held for the main thread's next frame.
+void tell_plugins_locked(unsigned kind, std::uint16_t member, const std::string& online_id,
+                         const std::string& reason = "") {
+    plugins_session_event(kind, g.room_id, member, online_id.c_str(), g.member_id, g.owner_id, reason.c_str());
+}
+
 RequestOptParam opt_or_default(const RequestOptParam* opt) {
     RequestOptParam o = opt && opt->cbFunc ? *opt : g.dflt;
     return o;
@@ -429,6 +437,7 @@ void end_session_locked(const char* why) {
     if (!g.in_room && !g.leave_pending) return;
     g_restore_world = true;
     host_log("np: session over (%s): room %llu", why, static_cast<unsigned long long>(g.room_id));
+    if (g.in_room) tell_plugins_locked(BB_SESSION_LEFT, g.member_id, net::online_id(), why);
     if (!g.session_id.empty()) {
         const std::string sid = g.session_id;
         const int mid = g.member_id;
@@ -464,6 +473,8 @@ void room_gone_locked(std::uint16_t event, std::uint8_t cause, const std::uint8_
     if (!g.in_room) return;
     const std::uint64_t room = g.room_id;
     host_log("np: room %llu gone (%s): the game hears 0x%x", static_cast<unsigned long long>(room), why.c_str(), event);
+    tell_plugins_locked(event == kEvKickedOut ? BB_SESSION_KICKED : BB_SESSION_CLOSED, g.member_id, net::online_id(),
+                        why);
     g_restore_world = true;
     std::vector<std::uint16_t> ids;
     for (const net::Peer& p : room_peers()) {
@@ -633,6 +644,7 @@ void on_server_event(const json::Value& ev) {
         }
         host_log("np: member %u (%s) joined room %llu", p.member_id, p.online_id.c_str(),
                  static_cast<unsigned long long>(g.room_id));
+        tell_plugins_locked(BB_SESSION_MEMBER_JOINED, p.member_id, p.online_id);
         net::dispatch_after(300, net::Prio::RoomEvent, [p] {
             M2Call c;
             {
@@ -659,6 +671,7 @@ void on_server_event(const json::Value& ev) {
                                    : (reason == "leave_room" || reason.empty()) ? kCauseLeave
                                                                                 : kCauseMemberDisappeared;
         host_log("np: member %u (%s) left (%s)", mid, p.online_id.c_str(), reason.c_str());
+        tell_plugins_locked(BB_SESSION_MEMBER_LEFT, mid, p.online_id, reason);
         // DEAD for that member, then MEMBER_LEFT; the room stays ours. The
         // host used to leave the server's room here when one or fewer peers
         // were left: with three in a room one leaving took the third out
@@ -883,6 +896,8 @@ GUEST_ABI int m2_create_join_room(unsigned ctx, const std::uint8_t* reqp, const 
         {
             std::lock_guard<std::mutex> lk2(g.mu);
             if (!error) {
+                // The game left its room without LeaveRoom: over for the plugins too.
+                if (g.in_room) tell_plugins_locked(BB_SESSION_LEFT, g.member_id, net::online_id(), "a new room");
                 g.session_id = sid;
                 g.room_id = room;
                 g.member_id = static_cast<std::uint16_t>(net::int_of(reply, "MemberId", 1));
@@ -896,6 +911,7 @@ GUEST_ABI int m2_create_join_room(unsigned ctx, const std::uint8_t* reqp, const 
                 resp = build_room_response(room, g.member_id, g.member_id, max_slot);
                 host_log("np: room %llu created, we are member %u", static_cast<unsigned long long>(room),
                          g.member_id);
+                tell_plugins_locked(BB_SESSION_CREATED, g.member_id, net::online_id());
             }
         }
         net::dispatch_after(300, net::Prio::Request, [req, o, error, resp] {
@@ -933,6 +949,7 @@ GUEST_ABI int m2_join_room(unsigned ctx, const std::uint8_t* reqp, const Request
             std::lock_guard<std::mutex> lk2(g.mu);
             if (g.joining_room == room) g.joining_room = 0;
             if (!error) {
+                if (g.in_room) tell_plugins_locked(BB_SESSION_LEFT, g.member_id, net::online_id(), "a new room");
                 g.session_id = net::str_of(reply, "SessionId");
                 g.room_id = room;
                 g.member_id = static_cast<std::uint16_t>(net::int_of(reply, "MemberId", 2));
@@ -957,6 +974,13 @@ GUEST_ABI int m2_join_room(unsigned ctx, const std::uint8_t* reqp, const Request
                 resp = build_room_response(room, g.member_id, g.owner_id, g.max_slot);
                 host_log("np: joined room %llu as member %u with %zu peers", static_cast<unsigned long long>(room),
                          g.member_id, room_peers().size());
+                // The guest's own join, then everyone the answer listed: the
+                // game hears them in the answer, not as MEMBER_JOINED.
+                tell_plugins_locked(BB_SESSION_JOINED, g.member_id, net::online_id());
+                for (const net::Peer& p : room_peers()) {
+                    if (p.member_id == g.member_id) continue;
+                    tell_plugins_locked(BB_SESSION_MEMBER_JOINED, p.member_id, p.online_id);
+                }
             }
         }
         // The host's rules, when the server says them (HostRuleset) and they
