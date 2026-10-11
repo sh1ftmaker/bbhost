@@ -12,6 +12,7 @@
 //   stay_after_boss = true # cooperators stay when the boss dies
 //   keep_on_load = true    # the room outlives a map load instead of ending with it
 //   follow_host = true     # guests travel to the lamp the host travels to
+//   keep_on_death = true   # the host's death sends the guests to its lamp, not home
 //
 // Every player in a session needs it: it announces itself in the session's
 // rules (X-BBHost-Ruleset), so the server only matches seamless players with
@@ -40,6 +41,7 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
     {BB_OPT_BOOL, "stay_after_boss", "Stay after a boss", "Cooperators stay in the host's world when the boss dies.", "true"},
     {BB_OPT_BOOL, "keep_on_load", "Keep the session through loads", "A map load no longer ends the session.", "true"},
     {BB_OPT_BOOL, "follow_host", "Follow the host", "When the host travels to a lamp, the guests travel there too.", "true"},
+    {BB_OPT_BOOL, "keep_on_death", "Keep the party when the host dies", "The guests travel to the host's lamp instead of going home.", "true"},
     {BB_OPT_END}};
 
 namespace {
@@ -53,6 +55,7 @@ bool g_anywhere = true;
 bool g_stay_after_boss = true;
 bool g_keep_on_load = true;
 bool g_follow = true;
+bool g_keep_on_death = true;
 
 bool option(const char* key, bool def) {
     const std::string v = g.api->config((std::string("seamless.") + key).c_str());
@@ -138,6 +141,15 @@ const std::vector<Patch> kStayAfterBoss = {
     {"cooperator returns", 0x178599c, {0x4c, 0x83, 0x78, 0x78, 0x01}, {0x75, 0x46}, {0xeb, 0x46}},
 };
 
+// The host's death ends the session for the guests: the host's OnEvent_4000
+// (0x17813d0) broadcasts HostDead (LuaCallStart(4000, 1) at 0x17816d7) and
+// each guest goes home from it. Without the broadcast the host just respawns
+// at its lamp - a load that keeps the room, as a host's does - and the plugin
+// sends the guests there (on_world_transition).
+const std::vector<Patch> kHostDeath = {
+    {"host dead broadcast", 0x17816d7, {0x4c, 0x89, 0xf7}, {0xe8, 0x84, 0xd2, 0xfa, 0xff}, {0x0f, 0x1f, 0x44, 0x00, 0x00}},
+};
+
 // A map load ends the session: the per-area event payload's destructor
 // (0x1d470f0) calls SprjSessionManager's BeginLeaveSession (0x22d07a0,
 // reason 0xff000023). In its place it calls the manager's "a matching
@@ -198,7 +210,7 @@ constexpr std::uint32_t kType = 0x1a;
 constexpr std::uint32_t kMagic = 0x434d4c53;  // "SLMC"
 constexpr std::size_t kMax = 0x400;
 
-enum Kind : std::uint8_t { Ping = 1, HostLampTravel = 2 };
+enum Kind : std::uint8_t { Ping = 1, HostLampTravel = 2, HostRespawn = 3 };
 
 #pragma pack(push, 1)
 struct Header {
@@ -326,6 +338,7 @@ constexpr std::uint64_t kWarpBonfire = 0x172e050;
 const std::uint8_t kWarpBonfirePrologue[14] = {0x55, 0x48, 0x89, 0xe5, 0x48, 0x63, 0xc6,
                                                0x48, 0x69, 0xc8, 0x89, 0xb5, 0xf8, 0x14};
 std::int32_t g_follow_to = 0;  // a lamp the host went to, for this guest to follow
+std::string g_host_name;  // the host's online id, while a guest in a party
 int g_following = 0;  // frames left in which this guest's own world transition is the follow
 
 // SessionWorldTransition (0x17cde30) leaves the room with BeginLeaveSession
@@ -355,6 +368,13 @@ void on_message(const chan::Header& h, const std::uint8_t* body) {
         g.log("seamless: ping %u from player %d (seq %u)", count, h.sender_no, h.seq);
         break;
     }
+    case chan::HostRespawn:
+        if (g_keep_on_death && h.body_size >= sizeof g_follow_to && !chan::session().host()) {
+            std::memcpy(&g_follow_to, body, sizeof g_follow_to);
+            g.message((g_host_name.empty() ? std::string("The host") : g_host_name) + " has fallen - regrouping at the lamp");
+            g.log("seamless: the host died and respawns at lamp %d; following", g_follow_to);
+        }
+        break;
     case chan::HostLampTravel:
         if (g_follow && h.body_size >= sizeof g_follow_to && !chan::session().host()) {
             std::memcpy(&g_follow_to, body, sizeof g_follow_to);
@@ -385,9 +405,20 @@ std::uint64_t caller_bn(const BbHookCtx* ctx) {
 }
 
 bool g_trace = false;
+constexpr std::uint64_t kFromHostDeathRespawn = 0x1781ee3;  // SoloPlayDeath_2's call returns here
 
 int on_world_transition(BbHookCtx* ctx, void*) {
     const chan::Session s = chan::session();
+    // The host died and respawns at its lamp (GameStateMan +0x1528, the
+    // ReturnPointParam row the respawn loads): the guests go there too.
+    if (g_keep_on_death && s.ready() && s.host() && caller_bn(ctx) == kFromHostDeathRespawn) {
+        if (std::uint8_t* gsm = chan::deref(kGameStateManPtr)) {
+            const std::int32_t rp = chan::at<std::int32_t>(gsm, 0x1528);
+            const int n = chan::send_all(chan::HostRespawn, &rp, sizeof rp);
+            g.log("seamless: the host died; it respawns at lamp %d (keeps the room: %d); told %d guest%s", rp,
+                  chan::at<std::uint8_t>(gsm, 0x1592), n, n == 1 ? "" : "s");
+        }
+    }
     if (g_following && s.mgr && s.role == 6) {
         if (std::uint8_t* gsm = chan::deref(kGameStateManPtr)) {
             g_keep_room = gsm + 0x1592;
@@ -410,7 +441,6 @@ int trace_hook(BbHookCtx* ctx, void* what) {
     return 0;
 }
 
-std::string g_host_name;  // the host's online id, while a guest in a party
 int g_party = 0;          // other members in the room
 
 void on_session(const BbSessionEvent* ev, void*) {
@@ -472,6 +502,33 @@ const std::uint8_t kDestroyAllTasksPrologue[14] = {0x55, 0x48, 0x89, 0xe5, 0x41,
 constexpr std::uint64_t kDestroyAllTasksFromUnload = 0x1d4720c;
 constexpr std::uint64_t kMultiPlayManPtr = 0x5940230;
 constexpr int kTaskStepUpdate = 6, kTaskStepCreate = 4;
+constexpr std::uint64_t kTaskAllocatorPtr = 0x5940438;  // its vtable +0x58: (this, size, align) -> memory
+constexpr std::uint64_t kTaskConstruct = 0x224f9f0;     // (task, route, mode)
+constexpr std::uint64_t kTaskVectorPush = 0x2255a70;    // (CSMultiPlayMan +8, &task)
+
+// A task for a route that has none, made as the game makes one when a member
+// joins (WorldSessionObjectMan's event 0x0e, 0x1b8c217..0x1b8c311): mode 2
+// for a guest's host (SprjSessionManager +0xd0), 1 for anyone else, and the
+// flags a joined member has, so it walks to Create by itself.
+bool new_task(const chan::Session& s, std::uint8_t* mpm, std::uint8_t* route) {
+    std::uint8_t* alloc = chan::deref(kTaskAllocatorPtr);
+    std::uint8_t* gsm = chan::deref(kGameStateManPtr);
+    const std::uint64_t base = g.api->guest_addr(0x400000);
+    if (!alloc || !gsm || !base) return false;
+    const std::uint64_t fn = *reinterpret_cast<std::uint64_t*>(*reinterpret_cast<std::uint8_t**>(alloc) + 0x58);
+    auto* task = reinterpret_cast<std::uint8_t*>(chan::call(fn - base + 0x400000, chan::u(alloc), 0x100, 8));
+    if (!task) return false;
+    const int mode = (chan::call(chan::kRouteMatches, chan::u(route), chan::u(s.mgr + 0xd0)) & 0xff) ? 2 : 1;
+    chan::call(kTaskConstruct, chan::u(task), chan::u(route), static_cast<std::uint64_t>(mode));
+    static std::uint8_t* pushed;
+    pushed = task;
+    chan::call(kTaskVectorPush, chan::u(mpm + 8), chan::u(&pushed));
+    chan::at<std::uint8_t>(task, 0xec) = chan::at<std::uint8_t>(gsm, 0x16f4);
+    chan::at<std::uint8_t>(task, 0xed) |= 0x0d;
+    g.log("seamless: a new task (mode %d) for a member without one", mode);
+    return true;
+}
+
 int g_reinsert_wait = 0;   // frames until the kept tasks are sent back to Create (0: nothing to do)
 int g_reinsert_tries = 0;  // seconds of retries left while the world is not ready for it
 
@@ -506,16 +563,22 @@ bool reinsert() {
     int sent = 0;
     chan::for_each_peer(s, [&](std::uint8_t* route) {
         if (chan::player_of(route)) return;
+        bool found = false;
         for (std::uint8_t** t = it; t && t < end; ++t) {
             std::uint8_t* task = *t;
             if (!task || !(chan::call(chan::kRouteMatches, chan::u(task + 0xc8), chan::u(route)) & 0xff)) continue;
             const int mode = chan::at<std::int32_t>(task, 0xe8), step = chan::at<std::int32_t>(task, 0x50);
+            found = true;
             g.log("seamless: task for a member: mode %d, step %d, flags 0x%02x", mode, step, chan::at<std::uint8_t>(task, 0xed));
             if ((mode != 1 && mode != 2) || step != kTaskStepUpdate) continue;
             chan::at<std::uint8_t>(task, 0xed) |= 0x0d;
             chan::at<std::int32_t>(task, 0x54) = kTaskStepCreate;
             chan::at<std::int32_t>(task, 0x50) = kTaskStepCreate;
             ++sent;
+        }
+        if (!found) {
+            g.log("seamless: no task for a member among %d", static_cast<int>(end - it));
+            if (new_task(s, mpm, route)) ++sent;
         }
     });
     g.log("seamless: after the load: %d character%s to make again", sent, sent == 1 ? "" : "s");
@@ -528,6 +591,7 @@ void read_options() {
     g_stay_after_boss = option("stay_after_boss", true);
     g_keep_on_load = option("keep_on_load", true);
     g_follow = option("follow_host", true);
+    g_keep_on_death = option("keep_on_death", true);
 }
 
 }  // namespace
@@ -549,6 +613,7 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
     if (g_anywhere) apply("bells anywhere", kAnywhere);
     if (g_stay_after_boss) apply("stay after a boss", kStayAfterBoss);
     if (g_keep_on_load) apply("keep the session through loads", kKeepOnLoad);
+    if (g_keep_on_death) apply("keep the party when the host dies", kHostDeath);
     // The Beckoning Bell's Insight is its goods row's consumeHeroPoint (the
     // Souls games' humanity): 0 once the table has loaded.
     if (g_free_bells) {

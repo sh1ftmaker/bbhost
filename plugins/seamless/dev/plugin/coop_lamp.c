@@ -53,6 +53,8 @@ static int g_reload_done = 0, g_others = -1, g_result_done = 0;
 static int g_loads = 0, g_expect = 1, g_host_reloads = 0; /* loads since the join; how many to make/expect */
 static char g_gate[512];
 static double g_hold = 75;
+static double g_kill_after = 0; /* COOP_KILL_AFTER: kill the player that long after the party forms */
+static int g_kill_sp = 4014, g_killed = 0;
 static char g_session[64];
 
 /* The session as SprjSessionManager (pointer at 0x5940290) holds it: its
@@ -184,6 +186,12 @@ static void on_frame(void* user) {
                 g_others = others;
             }
             if (others > 0 && !g_others_since) g_others_since = t;
+            if (g_kill_after > 0 && !g_killed && g_others_since && others > 0 && t - g_others_since >= g_kill_after) {
+                g_killed = 1;
+                void* me = chr ? chr : player_ins();
+                int r = me ? api->sp_effect_apply(me, g_kill_sp) : -1;
+                api->log("coop_lamp: kill: SpEffect %d on the player -> %s", g_kill_sp, r == 0 ? "applied" : "failed");
+            }
             if (g_reload_after > 0 && g_host_reloads < g_expect && g_others_since && others > 0 &&
                 t - (g_reload_at ? g_reload_at : g_others_since) >= g_reload_after + (g_host_reloads ? 20 : 0)) {
                 ++g_host_reloads;
@@ -240,6 +248,8 @@ BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* a) {
     if ((e = getenv("COOP_BELL_AT")) && *e) g_bell_at = atof(e);
     if ((e = getenv("COOP_RELOAD_AFTER")) && *e) g_reload_after = atof(e);
     if ((e = getenv("COOP_LOADS")) && *e) g_expect = atoi(e);
+    if ((e = getenv("COOP_KILL_AFTER")) && *e) g_kill_after = atof(e);
+    if ((e = getenv("COOP_KILL_SPEFFECT")) && *e) g_kill_sp = atoi(e);
     if ((e = getenv("COOP_HOLD")) && *e) g_hold = atof(e);
     if ((e = getenv("COOP_BELL_GATE")) && *e) snprintf(g_gate, sizeof g_gate, "%s", e);
     a->on_frame(on_frame, 0);
