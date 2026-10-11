@@ -60,6 +60,7 @@ param(
     [int]$HoldAfterJoin = 15,            # without -ReloadAfter: stop this long after both report the join
     [double]$LampDelay = 2,              # seconds in the Dream before the lamp travel
     [int]$ReloadAfter = 0,                # both: lamp travel again this many s after the other player shows up
+    [switch]$Trace,                      # BBHOST_SEAMLESS_TRACE=1: log who calls BeginLeaveSession / SessionWorldTransition
     [switch]$Ping,                       # BBHOST_SEAMLESS_PING=1: the seamless plugin's channel test
     [switch]$HostOnlyReload,             # only the host reloads (-ReloadAfter); the guest follows it or not
     [switch]$SummonInvite                # guest: BBHOST_SUMMON_INVITE=1 (bbhost hands the game the server's guest_invite as its type-1 item)
@@ -160,7 +161,7 @@ $pluginToml
 $common = @{
     BBHOST_SETUP_WINDOW = "0"; BBHOST_SKIP_INTRO = "1"; BBHOST_PRESENT_MODE = "fifo";
     BBHOST_NP_TRACE = "1"; BBHOST_TEST_INSIGHT = "$Insight"; BBHOST_GAME_FPS = "60";
-    BBHOST_TEST_WARP = "1"; BBHOST_TEST_UNLOCK_LAMPS = "1"; COOP_LAMP_RP = "$LampRp"; COOP_RELOAD_AFTER = "$ReloadAfter"; COOP_LAMP_DELAY = "$LampDelay"; BBHOST_SEAMLESS_PING = $(if ($Ping) { "1" } else { "0" })
+    BBHOST_TEST_WARP = "1"; BBHOST_TEST_UNLOCK_LAMPS = "1"; COOP_LAMP_RP = "$LampRp"; COOP_RELOAD_AFTER = "$ReloadAfter"; COOP_LAMP_DELAY = "$LampDelay"; BBHOST_SEAMLESS_PING = $(if ($Ping) { "1" } else { "0" }); BBHOST_SEAMLESS_TRACE = $(if ($Trace) { "1" } else { "0" })
 }
 
 function Start-Instance($inst, [hashtable]$envs) {

@@ -21,6 +21,8 @@ Every request and answer is logged (body included) to the console and to
 
     python server.py [--log FILE] [--http-port 18671] [--ssinfo-port 20443]
                      [--stun 127.0.0.1:3478] [--relay] [--any-area] [-q]
+                     [--summon-poll S] [--sign-refresh S] [--no-ruleset-match]
+                     [--invite-ttl S] [--invite-same-area]
 
 The protocol notes are in ../README.md. Nothing here talks to any host but
 127.0.0.1.
@@ -193,6 +195,26 @@ class State:
         # events
         self.next_event = 1
         self.events: dict[str, list] = {}      # online id -> [event]
+        # friend invites / parties: (from online id, to online id) -> record
+        self.invites: dict[tuple, dict] = {}
+        self.invite_ttl = 1800.0
+
+    # ---- invites / parties ---------------------------------------------
+    def invited_by(self, online: str) -> set:
+        """The players `online` has invited (its sign search sees only them)."""
+        return {to for (fr, to) in self.invites if fr == online} if online else set()
+
+    def inviters_of(self, online: str) -> set:
+        """The players that invited `online` (its sign is kept for them)."""
+        return {fr for (fr, to) in self.invites if to == online} if online else set()
+
+    def touch_invite(self, fr: str, to: str, state: str | None = None) -> None:
+        rec = self.invites.get((fr, to))
+        if rec:
+            rec["t"] = time.time()
+            if state and rec["state"] != state:
+                rec["state"] = state
+                log(f"invite {fr} -> {to}: {state}")
 
     # ---- events ---------------------------------------------------------
     def push(self, online: str, name: str, **fields) -> None:
@@ -268,10 +290,75 @@ class State:
             for k, s in list(self.signs.items()):
                 if now - s["t"] > (900 if s["state"] in ("claimed", "delivered") else self.sign_ttl):
                     self.signs.pop(k, None)
+            for k, inv in list(self.invites.items()):
+                if now - inv["t"] > self.invite_ttl:
+                    self.invites.pop(k, None)
+                    log(f"invite {k[0]} -> {k[1]}: expired")
 
 
 STATE: State | None = None
 OPTS = None
+
+# The current request's bbhost headers (set per request by Handler._handle).
+_req = threading.local()
+
+
+def req_rules() -> str:
+    return getattr(_req, "rules", "") or "vanilla"
+
+
+def req_adopt() -> str:
+    return getattr(_req, "adopt", "") or ""
+
+
+# --------------------------------------------------------------------------
+# rulesets (X-BBHost-Ruleset, built by bbhost's host/plugins.cpp own_ruleset):
+# "vanilla", or the gameplay plugins' entries sorted and joined by ",", each
+# "name[;elem...]" ("randomizer;seed=x", "seamless;v=2;pw=ab12cd34ef56;free").
+# Players meet only when their entries are the same (the upstream server's
+# documented behaviour, docs/online.md "Modded worlds stay apart"), except the
+# entries of plugins the visitor adopts (X-BBHost-Adopt), which bbhost's
+# plugins_enter_world also leaves out. A "pw=<token>" element makes a session
+# private: it must be the same on both sides, adopted plugin or not.
+
+def rule_entries(rules: str) -> list[str]:
+    return sorted(p.strip() for p in (rules or "").split(",") if p.strip() and p.strip() != "vanilla")
+
+
+def _entry_name(e: str) -> str:
+    return e.split(";", 1)[0]
+
+
+def _entry_pw(e: str) -> str:
+    return next((el[3:] for el in e.split(";")[1:] if el.startswith("pw=")), "")
+
+
+def _strip_pw(e: str) -> str:
+    return ";".join(el for el in e.split(";") if not el.startswith("pw="))
+
+
+def rules_compatible(host_rules: str, visitor_rules: str, visitor_adopt: str = "") -> tuple[bool, str]:
+    """Whether a visitor playing by `visitor_rules` (and adopting the plugins
+    named in `visitor_adopt`) may meet a host playing by `host_rules`."""
+    if OPTS.no_ruleset_match:
+        return True, "ruleset matching off"
+    h, v = rule_entries(host_rules), rule_entries(visitor_rules)
+    adopt = {a.strip() for a in (visitor_adopt or "").split(",") if a.strip()}
+    hs = [_strip_pw(e) for e in h if _entry_name(e) not in adopt]
+    vs = [_strip_pw(e) for e in v if _entry_name(e) not in adopt]
+    if hs != vs:
+        return False, f"rules differ ({','.join(hs) or 'vanilla'} vs {','.join(vs) or 'vanilla'})"
+    hp = {_entry_name(e): _entry_pw(e) for e in h if _entry_pw(e)}
+    vp = {_entry_name(e): _entry_pw(e) for e in v if _entry_pw(e)}
+    for name in sorted(set(hp) | set(vp)):
+        a, b = hp.get(name, ""), vp.get(name, "")
+        if a != b:
+            if not a or not b:
+                return False, f"{name}: private (pw) vs public"
+            return False, f"{name}: password differs"
+    what = "private" if hp else "same rules"
+    adopted = sorted(adopt & ({_entry_name(e) for e in h} | {_entry_name(e) for e in v}))
+    return True, f"{what} '{','.join(hs) or 'vanilla'}'" + (f" (adopting {','.join(adopted)})" if adopted else "")
 
 
 # --------------------------------------------------------------------------
@@ -324,21 +411,24 @@ def h_summon_create(body: dict, q: dict) -> dict:
     st = STATE
     key = _sign_key(body)
     now = time.time()
+    who = {"rules": req_rules(), "adopt": req_adopt(), "online": online_of_user(key[1])}
     with st.lock:
         s = st.signs.get(key)
         if not s or s["state"] == "consumed":
-            st.signs[key] = {"ad": body, "state": "advertised", "t": now, "claim": None}
-            log(f"sign: advertised user {key[1]} type {body.get('SummonType')} area {body.get('AreaId')} "
-                f"region {body.get('AreaRegionId')} level {body.get('MatchingLevel')}")
+            st.signs[key] = {"ad": body, "state": "advertised", "t": now, "claim": None, **who}
+            log(f"sign: advertised user {key[1]} ({who['online']}) type {body.get('SummonType')} area "
+                f"{body.get('AreaId')} region {body.get('AreaRegionId')} level {body.get('MatchingLevel')} "
+                f"ruleset {who['rules']!r}" + (f" adopts {who['adopt']!r}" if who["adopt"] else ""))
             return ok("SummonDataCreateResponse")
         # A claim is delivered for 30 s (the guest's game reads it from its
         # next create); a create after that is a fresh sign (the guest came
         # home and rang again without a delete reaching us).
         if s["state"] in ("claimed", "delivered") and now - s["claimed_at"] > OPTS.claim_seconds:
-            st.signs[key] = {"ad": body, "state": "advertised", "t": now, "claim": None}
-            log(f"sign: re-advertised user {key[1]} (old claim expired)")
+            st.signs[key] = {"ad": body, "state": "advertised", "t": now, "claim": None, **who}
+            log(f"sign: re-advertised user {key[1]} (old claim expired), ruleset {who['rules']!r}")
             return ok("SummonDataCreateResponse")
         s["ad"], s["t"] = body, now
+        s.update(who)
         if s["state"] == "claimed":
             s["state"] = "delivered"
         if s["state"] == "delivered" and s["claim"]:
@@ -351,13 +441,13 @@ def h_summon_create(body: dict, q: dict) -> dict:
         return ok("SummonDataCreateResponse")
 
 
-def _matches(req: dict, sign: dict) -> tuple[bool, str]:
+def _matches(req: dict, sign: dict, ignore_area: bool = False) -> tuple[bool, str]:
     if int(sign.get("UserId", -1)) == int(req.get("UserId", -2)) or sign.get("SessionId") == req.get("SessionId"):
         return False, "own sign"
     for k in ("SummonDataVersion",):
         if k in req and req[k] is not None and req[k] != sign.get(k):
             return False, f"{k} {sign.get(k)} != {req[k]}"
-    if not OPTS.any_area:
+    if not OPTS.any_area and not ignore_area:
         for k in ("AreaId", "AreaRegionId"):
             if k in req and req[k] is not None and req[k] != sign.get(k):
                 return False, f"{k} {sign.get(k)} != {req[k]}"
@@ -371,22 +461,56 @@ def _matches(req: dict, sign: dict) -> tuple[bool, str]:
     return True, ""
 
 
+def _invite_gate(me: str, owner: str) -> tuple[bool, str, bool]:
+    """Friend invites (POST /seamless/invite): a player who invited someone
+    sees only the invited players' signs, and an invited player's sign is
+    kept for its inviters. Returns (allowed, reason, invited pair)."""
+    st = STATE
+    targets, inviters = st.invited_by(me), st.inviters_of(owner)
+    if targets and owner not in targets:
+        return False, f"{me} invited {sorted(targets)}, not {owner or '?'}", False
+    if inviters and me not in inviters:
+        return False, f"kept for {sorted(inviters)}'s invite", False
+    return True, "", bool(targets) and owner in targets
+
+
+def sign_visible(body: dict, s: dict, me: str) -> tuple[bool, str]:
+    """Whether the searcher (body, its request's ruleset, online id `me`)
+    may see sign record `s`, and why."""
+    owner = s.get("online") or online_of_user(int(s["ad"].get("UserId", 0) or 0))
+    allowed, why, invited = _invite_gate(me, owner)
+    if not allowed:
+        return False, why
+    good, reason = _matches(body, s["ad"], ignore_area=invited and not OPTS.invite_same_area)
+    if not good:
+        return False, reason
+    good, reason = rules_compatible(req_rules(), s.get("rules", "vanilla"), s.get("adopt", ""))
+    if not good:
+        return False, f"ruleset: {reason}"
+    return True, reason + (" (invited)" if invited else "")
+
+
 def h_summon_get(body: dict, q: dict) -> dict:
     st = STATE
     st.reap()
-    out, why = [], []
+    out, why, hit = [], [], []
     with st.lock:
+        me = online_of_user(int(body.get("UserId", 0) or 0))
         for key, s in sorted(st.signs.items(), key=lambda kv: -kv[1]["t"]):
             if s["state"] != "advertised":
                 why.append(f"user {key[1]}: {s['state']}")
                 continue
-            good, reason = _matches(body, s["ad"])
+            good, reason = sign_visible(body, s, me)
             if good:
                 out.append(_available(s["ad"]))
+                hit.append(f"user {key[1]}: {reason}")
+                if s.get("online") in st.invited_by(me):
+                    st.touch_invite(me, s["online"])
             else:
                 why.append(f"user {key[1]}: {reason}")
     out = out[: int(body.get("GetMaxCount", 20) or 20)]
-    log(f"sign search by user {body.get('UserId')}: {len(out)} found" + (f"; skipped {why}" if why else ""))
+    log(f"sign search by user {body.get('UserId')} ({me}, ruleset {req_rules()!r}): {len(out)} found"
+        + (f" {hit}" if hit else "") + (f"; skipped {why}" if why else ""))
     return {"SummonDataList": out, "ResKind": 0, "MessageId": "SummonDataGetListResponse"}
 
 
@@ -409,9 +533,18 @@ def h_summon_request(body: dict, q: dict) -> dict:
         if s["state"] in ("claimed", "delivered"):
             log(f"summon request for user {key[1]}: already {s['state']}")
             return ok("SummonDataSummonResponse")
+        me = online_of_user(int(body.get("UserId", 0) or 0))
+        allowed, why, invited = _invite_gate(me, s.get("online", ""))
+        good, reason = rules_compatible(req_rules(), s.get("rules", "vanilla"), s.get("adopt", ""))
+        if not allowed or not good:
+            log(f"summon request by user {body.get('UserId')} for user {key[1]}: refused "
+                f"({why if not allowed else 'ruleset: ' + reason})")
+            return ok("SummonDataSummonResponse")
         s["state"], s["claim"], s["t"] = "claimed", body, time.time()
         s["claimed_at"] = s["t"]
-    log(f"summon request: user {body.get('UserId')} claimed user {key[1]}'s sign")
+        if invited:
+            st.touch_invite(me, s["online"], "claimed")
+    log(f"summon request: user {body.get('UserId')} claimed user {key[1]}'s sign ({reason})")
     if not OPTS.no_guest_invite:
         send_guest_invite(int(body.get("UserId", 0) or 0), key[1])
     return ok("SummonDataSummonResponse")
@@ -509,6 +642,8 @@ def np_context_start(b: dict) -> dict:
         st.players[online] = {**b, "t": time.time()}
         st.events[online] = []  # a new run starts with an empty queue
         st.leave_all(online, "member_disappeared")
+        for fr in sorted(st.inviters_of(online)):
+            push_invite_event(st.invites[(fr, online)])
     log(f"np: {online} online, signaling {b.get('SignalingAddr')}:{b.get('SignalingPort')} "
         f"mapped {b.get('MappedAddr')}:{b.get('MappedPort')}")
     return {"ResKind": 0}
@@ -575,6 +710,11 @@ def np_join_room(b: dict) -> dict:
         if len(room["members"]) >= room["max"]:
             log(f"np: {online} join room {rid}: full")
             return {"ResKind": 1, "Error": "room full"}
+        good, reason = rules_compatible(room["ruleset"], req_rules(), req_adopt())
+        log(f"np: {online} join room {rid}: ruleset {req_rules()!r} vs room {room['ruleset']!r}: "
+            + ("ok, " if good else "refused, ") + reason)
+        if not good:
+            return {"ResKind": 1, "Error": f"ruleset mismatch: {reason}"}
         mid = room["next_mid"]
         room["next_mid"] += 1
         sid = secrets.token_hex(8)
@@ -585,6 +725,9 @@ def np_join_room(b: dict) -> dict:
         for omid, om in room["members"].items():
             if omid != mid:
                 st.push(om["online"], "room_member_joined", **me)
+        owner = room["members"][room["owner"]]["online"]
+        if (owner, online) in st.invites:
+            st.touch_invite(owner, online, "joined")
     log(f"np: {online} joined room {rid} as member {mid} ({len(members)} other member(s))")
     return {"ResKind": 0, "RoomId": rid, "SessionId": sid, "MemberId": mid, "OwnerMemberId": room["owner"],
             "MaxMembers": room["max"], "Members": members, "HostRuleset": room["ruleset"]}
@@ -670,6 +813,73 @@ def np_session_blob(q: dict) -> dict:
     return {"ResKind": 0}
 
 
+# --------------------------------------------------------------------------
+# friend invites ("seamless" parties). The stock client never calls these; a
+# plugin (or curl) does. See ../README.md "Friend invites".
+
+def push_invite_event(inv: dict) -> None:
+    """Tells the invited player's bbhost (logged as "np: event #N
+    seamless_invite"; bbhost ignores the name otherwise) - for a plugin hook
+    or a tool watching the log."""
+    STATE.push(inv["to"], "seamless_invite", From=inv["from"], To=inv["to"], Ruleset=inv["rules"],
+               State=inv["state"])
+
+
+def _sender(b: dict) -> str:
+    """The inviting player as the server knows it: its online id (From), or
+    the game login's UserId / SessionId."""
+    st = STATE
+    fr = str(b.get("From") or b.get("from") or "")
+    if not fr and b.get("SessionId") in st.sessions:
+        fr = st.sessions[b["SessionId"]]["acct"]
+    if not fr and b.get("UserId") is not None:
+        fr = online_of_user(int(b.get("UserId") or 0))
+    return fr
+
+
+def seamless_invite(b: dict) -> dict:
+    st = STATE
+    fr, to = _sender(b), str(b.get("To") or b.get("to") or "")
+    if not fr or not to or fr == to:
+        return {"ResKind": 1, "Error": "need From (or UserId/SessionId) and a different To"}
+    with st.lock:
+        known = fr in st.players or fr in st.users
+        inv = st.invites.get((fr, to))
+        if not inv:
+            inv = {"from": fr, "to": to, "state": "pending", "rules": req_rules(), "since": time.time()}
+            st.invites[(fr, to)] = inv
+        inv["t"], inv["rules"] = time.time(), req_rules()
+        push_invite_event(inv)
+        targets, inviters = sorted(st.invited_by(fr)), sorted(st.inviters_of(to))
+    log(f"invite {fr} -> {to}: recorded (ruleset {inv['rules']!r}" + ("" if known else f"; {fr} is not online yet")
+        + f"); {fr}'s sign search now shows only {targets}, {to}'s sign is kept for {inviters}")
+    return {"ResKind": 0, "Invite": {k: inv[k] for k in ("from", "to", "state", "rules")}}
+
+
+def seamless_invite_cancel(b: dict) -> dict:
+    """From cancels its invite(s) (all, or the one to To); an invited player
+    declines every invite to it with {"Decline": "<its online id>"}."""
+    st = STATE
+    fr, to = _sender(b), str(b.get("To") or b.get("to") or "")
+    dec = str(b.get("Decline") or "")
+    with st.lock:
+        gone = [k for k in st.invites if (dec and k[1] == dec) or
+                (not dec and fr and k[0] == fr and (not to or k[1] == to))]
+        for k in gone:
+            st.invites.pop(k, None)
+    log(f"invite cancel {b}: removed {gone}")
+    return {"ResKind": 0, "Removed": [{"from": a, "to": c} for a, c in gone]}
+
+
+def seamless_invites(q: dict) -> dict:
+    st = STATE
+    who = q.get("online", "")
+    with st.lock:
+        out = [{k: inv[k] for k in ("from", "to", "state", "rules")} | {"age": round(time.time() - inv["since"])}
+               for inv in st.invites.values() if not who or who in (inv["from"], inv["to"])]
+    return {"ResKind": 0, "Invites": out}
+
+
 QUIET_PATHS = {"/np/events/poll", "/np/events/ack", "/mp/matching2/heartbeat"}
 
 
@@ -715,9 +925,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         raw = self._read_body() if self.command in ("POST", "PUT") else b""
         ua = self.headers.get("User-Agent", "")
         rules = self.headers.get("X-BBHost-Ruleset", "")
+        _req.rules, _req.adopt = rules, self.headers.get("X-BBHost-Adopt", "")
         quiet = path in QUIET_PATHS
         if not quiet or OPTS.verbose:
-            log(f"[{port}] {self.command} {self.path} ua={ua!r} ruleset={rules!r} body={short(raw)}")
+            log(f"[{port}] {self.command} {self.path} ua={ua!r} ruleset={rules!r}"
+                + (f" adopt={_req.adopt!r}" if _req.adopt else "") + f" body={short(raw)}")
         try:
             code, ctype, out = self._route(path, q, raw, rules)
         except Exception:
@@ -741,7 +953,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if cmd == "GET" and path in ("/status", "/"):
             return j({"ok": True, "service": "coop-test", "players": sorted(STATE.players),
                       "rooms": {r: [m["online"] for m in room["members"].values()] for r, room in STATE.rooms.items()},
-                      "signs": len(STATE.signs)})
+                      "signs": len(STATE.signs),
+                      "room_rules": {r: room["ruleset"] for r, room in STATE.rooms.items()},
+                      "invites": [f"{a} -> {b}: {inv['state']}" for (a, b), inv in STATE.invites.items()]})
+        if cmd == "GET" and path == "/seamless/invites":
+            return j(seamless_invites(q))
+        if cmd == "POST" and path == "/seamless/invite":
+            return j(seamless_invite(body))
+        if cmd == "POST" and path == "/seamless/invite/cancel":
+            return j(seamless_invite_cancel(body))
         if cmd == "GET" and path == "/mp/matching2/session_blob":
             return j(np_session_blob(q))
         if cmd == "PUT":  # the play log (bbhost rewrites the S3 uploads here)
@@ -883,17 +1103,34 @@ def main() -> int:
                     help="do not send the guest_invite event (room + host address) on a summon request")
     ap.add_argument("--claim-seconds", type=float, default=30.0,
                     help="how long a summoned sign hands its claim to the guest's creates")
+    ap.add_argument("--summon-poll", type=int, default=0, metavar="SECONDS",
+                    help="ss.info SummonDataGetListInterval: how often a ringing bell searches for signs "
+                         "(the game's default is 60 s; 0 leaves it out)")
+    ap.add_argument("--sign-refresh", type=int, default=0, metavar="SECONDS",
+                    help="ss.info SummonDataCreateInterval: how often a sign is re-sent (the game's default is 30 s; 0 leaves it out)")
+    ap.add_argument("--no-ruleset-match", action="store_true",
+                    help="match signs and rooms across rulesets (X-BBHost-Ruleset) and passwords")
+    ap.add_argument("--invite-ttl", type=float, default=1800.0,
+                    help="seconds an unused friend invite / party record lives (refreshed on use)")
+    ap.add_argument("--invite-same-area", action="store_true",
+                    help="invited pairs must also share AreaId/AreaRegionId (off: an invite matches anywhere)")
     ap.add_argument("--ssinfo-set", default="", help="extra ss.info values: Name=value,Name=value "
                                                      "(e.g. SummonDataGetListInterval=5)")
     ap.add_argument("--log", default=os.path.join(here, "server.log"))
     ap.add_argument("-v", "--verbose", action="store_true", help="also log event polls, acks and heartbeats")
     ap.add_argument("-q", "--quiet", action="store_true", help="log to the file only")
     OPTS = ap.parse_args()
-    OPTS.ssinfo_extra = dict(kv.split("=", 1) for kv in OPTS.ssinfo_set.split(",") if "=" in kv)
+    OPTS.ssinfo_extra = {}
+    if OPTS.summon_poll > 0:
+        OPTS.ssinfo_extra["SummonDataGetListInterval"] = str(OPTS.summon_poll)
+    if OPTS.sign_refresh > 0:
+        OPTS.ssinfo_extra["SummonDataCreateInterval"] = str(OPTS.sign_refresh)
+    OPTS.ssinfo_extra.update(kv.split("=", 1) for kv in OPTS.ssinfo_set.split(",") if "=" in kv)
     _quiet = OPTS.quiet
     os.makedirs(os.path.dirname(os.path.abspath(OPTS.log)), exist_ok=True)
     _log_file = open(OPTS.log, "a", encoding="utf-8")
     STATE = State(OPTS.any_area, OPTS.heartbeat_timeout)
+    STATE.invite_ttl = OPTS.invite_ttl
 
     servers = []
     for port in sorted({OPTS.http_port, OPTS.ssinfo_port}):
@@ -917,6 +1154,8 @@ def main() -> int:
 
     log(f"server up: http {OPTS.bind}:{OPTS.http_port} (game API + NP), ss.info also on :{OPTS.ssinfo_port}, "
         f"stun {stun_desc}; log {os.path.abspath(OPTS.log)}")
+    log(f"matching: rulesets {'ignored' if OPTS.no_ruleset_match else 'must match (pw= makes it private)'}, "
+        f"area {'any' if OPTS.any_area else 'same'}; ss.info extra {OPTS.ssinfo_extra or 'none'}")
     try:
         while True:
             time.sleep(3600)

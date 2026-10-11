@@ -1,11 +1,5 @@
 # Seamless co-op for bbhost: checkpoint (2026-10-10)
 
-> In this fork, the dev material lives in `plugins/seamless/dev/`. The
-> `coop-test/` paths below are the local working copy: `coop-test/X` is
-> `plugins/seamless/dev/X` here, except `build/`, `runs/` and the copied
-> shadp2p sources, which are not in the repo. Remove `dev/` before an
-> upstream PR.
-
 Goal: an Elden Ring Seamless Co-op-style **native plugin for bbhost**, to PR back to
 droogie/bbhost (upstream asks for it in issue #31, which has no reply yet). The route
 we chose is the hybrid:

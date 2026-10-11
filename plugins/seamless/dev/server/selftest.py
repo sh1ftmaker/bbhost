@@ -6,13 +6,15 @@ signaling resolve and P2P pings, without starting the game.
     python selftest.py [--bbhost-src C:/Users/shift/Desktop/Bloodborne/bbhost-src]
 
 Starts its own server.py on spare ports (HTTP 28671/28672, STUN 23478), runs a
-two-player and a three-player co-op summon, a leave and a host leave, and
-prints PASS/FAIL per check.
+two-player and a three-player co-op summon, a leave and a host leave, then the
+seamless matching rules (X-BBHost-Ruleset segregation, pw= private sessions,
+friend invites, --summon-poll), and prints PASS/FAIL per check.
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import json
 import os
 import subprocess
 import sys
@@ -65,7 +67,8 @@ def main() -> int:
         os.remove(log)
     srv = subprocess.Popen([sys.executable, os.path.join(HERE, "server.py"), "--http-port", "28671",
                             "--ssinfo-port", "28672", "--stun", "127.0.0.1:23478", "--log", log, "-q",
-                            "--heartbeat-timeout", "15", "--claim-seconds", "3", "--available-patch"])
+                            "--heartbeat-timeout", "15", "--claim-seconds", "3", "--available-patch",
+                            "--summon-poll", "5"])
     try:
         for _ in range(50):
             try:
@@ -85,9 +88,10 @@ def main() -> int:
 
         port = [9400]
 
-        def client(name):
+        def client(name, rules="vanilla", **kw):
             port[0] += 1
-            c = SimClient(b, name, nat="none", ip="127.0.0.1", p2p_port=port[0])
+            c = SimClient(b, name, nat="none", ip="127.0.0.1", p2p_port=port[0], **kw)
+            c.api.headers["X-BBHost-Ruleset"] = rules  # what bbhost sends on every request
             c.start()
             return c
 
@@ -117,6 +121,69 @@ def main() -> int:
         h.leave_room()
         check(wait(lambda: not g1.room and not g2.room, 6), "guests hear the room close when the host leaves")
         for c in (h, g1, g2):
+            c.stop()
+
+        # ---- seamless matching: rulesets, passwords, invites -------------------
+        check("<SummonDataGetListInterval1>5</SummonDataGetListInterval1>" in ss, "--summon-poll 5 is in ss.info")
+        R2, R1 = "seamless;v=2;free;anywhere", "seamless;v=1;free;anywhere"
+        PA, PB = "seamless;v=2;pw=aaaa1111bbbb;free;anywhere", "seamless;v=2;pw=cccc2222dddd;free;anywhere"
+        sh, sg, sold = client("SeamHost", R2), client("SeamGuest", R2), client("SeamOld", R1)
+        vh, vg = client("VanHost"), client("VanGuest")
+        ph, pg, px = client("PwHost", PA), client("PwGuest", PA), client("PwOther", PB)
+        everyone = (sh, sg, sold, vh, vg, ph, pg, px)
+        by_uid = {c.user_id: c.name for c in everyone}
+        for c in (sg, sold, vg, pg, px):
+            c.put_sign("coop")
+
+        def seen(host):
+            return {by_uid.get(x.get("UserId"), x.get("UserId")) for x in host.find_signs("coop")}
+
+        v = seen(sh)
+        check(v == {"SeamGuest"}, f"seamless v=2 host sees only the same ruleset's signs {sorted(v)}")
+        v = seen(vh)
+        check(v == {"VanGuest"}, f"vanilla host sees only vanilla signs {sorted(v)}")
+        v = seen(ph)
+        check(v == {"PwGuest"}, f"same password matches, other/no password does not {sorted(v)}")
+        v = seen(px)
+        check(not v, f"a different password sees nobody {sorted(v)}")
+        check(summon(sh, sg), "same-ruleset seamless summon completes")
+        check(summon(ph, pg), "same-password summon completes")
+        check(not vg.join_room(sh.room) and any("ruleset" in e for _, e in vg.join_failures),
+              f"a vanilla player cannot join a seamless room {vg.join_failures[-1:]}")
+        check(not px.join_room(ph.room), "a different password cannot join a private room")
+
+        # friend invite: InvHost invited InvFriend (in another area); InvStranger
+        # rings too, and OtherHost searches with the same rules
+        ih, ox = client("InvHost", R2), client("OtherHost", R2)
+        fr, st_ = client("InvFriend", R2, area=0x18020000), client("InvStranger", R2)
+        for c in (ih, ox, fr, st_):
+            by_uid[c.user_id] = c.name
+
+        def post(path, body, rules=R2):
+            req = urllib.request.Request("http://127.0.0.1:28671" + path, data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json", "X-BBHost-Ruleset": rules},
+                                         method="POST")
+            return json.loads(urllib.request.urlopen(req, timeout=3).read())
+
+        r = post("/seamless/invite", {"From": "InvHost", "To": "InvFriend"})
+        check(r.get("ResKind") == 0, f"POST /seamless/invite records it {r}")
+        fr.put_sign("coop")
+        st_.put_sign("coop")
+        v = seen(ih)
+        check(v == {"InvFriend"}, f"the inviter sees only the invited friend's sign, any area {sorted(v)}")
+        v = seen(ox)
+        check("InvStranger" in v and "InvFriend" not in v, f"another host does not get the friend's sign {sorted(v)}")
+        check(wait(lambda: any(e.get("Name") == "seamless_invite" for e in fr.events), 3),
+              "the friend gets a seamless_invite event")
+        check(summon(ih, fr), "the invited friend is summoned")
+        inv = json.loads(urllib.request.urlopen("http://127.0.0.1:28671/seamless/invites?online=InvHost",
+                                                timeout=3).read()).get("Invites", [])
+        check([i.get("state") for i in inv] == ["joined"], f"the invite is now a party record {inv}")
+        r = post("/seamless/invite/cancel", {"From": "InvHost"})
+        st_.put_sign("coop")
+        v = seen(ih)
+        check(len(r.get("Removed", [])) == 1 and "InvStranger" in v, f"after cancelling, the inviter sees others {sorted(v)}")
+        for c in everyone + (ih, ox, fr, st_):
             c.stop()
         bad = [w for ok, w in results if not ok]
         print(f"\n{len(results) - len(bad)}/{len(results)} passed; server log {log}")
