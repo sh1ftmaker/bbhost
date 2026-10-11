@@ -28,6 +28,7 @@ struct HostConfig {
     int playlog_upload_seconds = 5;   // online.playlog_upload_seconds: how often the game sends its play log (the game's own: 300; 0 keeps it)
     int playlog_sample_ms = 500;      // online.playlog_sample_ms: how often it logs the player's position (the game's own: 1500; 0 keeps it)
     int sign_timeout_seconds = 30;    // online.sign_timeout_seconds: how long a sign being answered may take (the game's own: 180; 0 keeps it)
+    int summon_poll_seconds = 0;      // online.summon_poll_seconds: how often the game asks for summon signs (the game's own: 60; 0 keeps it)
     // [update] (host/updater.h): whether to look for a newer release at start
     // (-1: only a release build does), where the releases are, and a file
     // holding a GitHub token for a private repository's.
