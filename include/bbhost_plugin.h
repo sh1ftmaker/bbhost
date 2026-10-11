@@ -1,4 +1,4 @@
-/* bbhost plugin API, version 10.
+/* bbhost plugin API, version 12.
  *
  * A plugin is a shared library (.so on Linux, .dll on Windows) in
  * <exe dir>/plugins or <data>/plugins. The host loads every one at start and
@@ -35,7 +35,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 11
+#define BB_PLUGIN_API_VERSION 12
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -161,6 +161,13 @@ typedef struct BbText {
     uint64_t bn_addr;      /* the game's UTF-16 string, by its Binary Ninja address */
     const uint16_t* text;  /* UTF-16, ended by a 0 */
 } BbText;
+
+/* Version 12: which point of its text overlay_text puts at (x, y) - the top
+ * left without any - and its dark box. */
+#define BB_TEXT_CENTER 1u  /* x is the middle of each line */
+#define BB_TEXT_RIGHT 2u   /* x is the end of each line */
+#define BB_TEXT_BOTTOM 4u  /* y is the bottom of the last line */
+#define BB_TEXT_NO_BOX 8u  /* no dark box behind the text */
 
 typedef struct BbHostApi {
     uint32_t version; /* BB_PLUGIN_API_VERSION */
@@ -373,6 +380,20 @@ typedef struct BbHostApi {
      * references moved, or -1 outside the image phase or for another eboot.
      * A string the code reaches some other way keeps its text. */
     int (*replace_text)(const BbText* texts, size_t count);
+
+    /* Version 12: the plugin's own text over the game. */
+    /* Draws `text` over the game every frame, for `seconds` (0 or less:
+     * until it is replaced), in place of the text last given this id; empty
+     * text removes it. (x, y) is a point of the game's picture, 0-1 from its
+     * top left (a point outside it draws nothing); flags are BB_TEXT_*.
+     * '\n' starts a new line. rgba is 0xRRGGBBAA. The font has printable
+     * ASCII only: any other character shows as '?'. Every plugin draws in
+     * one set of ids - take a range of your own (a high 16 bits); a higher
+     * id draws over a lower one. In screen space only: the host has no
+     * view-projection of the game's to place a point of the world with
+     * (docs/plugins.md). Any thread. 0 when shown; 1 for a bad argument or
+     * when 256 are up. */
+    int (*overlay_text)(uint32_t id, const char* text, float x, float y, uint32_t rgba, float seconds, uint32_t flags);
 } BbHostApi;
 
 #ifdef __cplusplus

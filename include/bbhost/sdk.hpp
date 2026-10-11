@@ -18,6 +18,7 @@
 #include "bbhost/params.hpp"
 
 #include <cstdarg>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -182,6 +183,15 @@ public:
     }
     void set_stat(const char* name, std::int64_t v) const { api->player_stat_set(name, v); }
     void message(const std::string& text, float seconds = 4.0f) const { api->show_message(text.c_str(), seconds); }
+    // Text over the game by id (overlay_text, version 12): at (x, y) in the
+    // picture, 0-1 from its top left, placed by BB_TEXT_* flags; seconds 0
+    // keeps it until replaced, empty text removes it. False on a host
+    // without it.
+    bool text(std::uint32_t id, const std::string& s, float x, float y, std::uint32_t rgba = 0xe6e6e6ffu,
+              float seconds = 0.0f, std::uint32_t flags = 0) const {
+        if (api->size < offsetof(BbHostApi, overlay_text) + sizeof(api->overlay_text)) return false;
+        return api->overlay_text(id, s.c_str(), x, y, rgba, seconds, flags) == 0;
+    }
 
     // The physics world's gravity (x, y, z; y up), which the player, the
     // enemies, ragdolls and loose objects all fall by: {0, -9.8, 0} as the

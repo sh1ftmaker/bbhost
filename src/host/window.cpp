@@ -1,4 +1,5 @@
 #include "host/window.h"
+#include "bbhost_plugin.h"
 #include "core/host_clock.h"
 #include "core/portable.h"
 
@@ -33,6 +34,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -100,6 +102,14 @@ std::mutex g_text_mu;
 std::mutex g_banner_mu;
 std::string g_banner_text;                                  // under g_banner_mu
 std::chrono::steady_clock::time_point g_banner_until;       // under g_banner_mu
+// Plugins' own text (host_text_show), by id: the order they draw in.
+struct PluginText {
+    std::string text;
+    float x = 0.0f, y = 0.0f;  // in the game's picture, 0-1
+    std::uint32_t rgba = 0, flags = 0;
+    std::chrono::steady_clock::time_point until;  // {}: until replaced
+};
+std::map<std::uint32_t, PluginText> g_plugin_texts;  // under g_banner_mu
 bool g_text_want = false, g_text_on = false, g_text_hidden = false;
 int g_text_result = 0;
 // The key that ended the text entry (Return or Escape), kept from the pad
@@ -1909,6 +1919,62 @@ bool host_window_pump() {
         host_overlay_text(x, y, scale, 0xe6e6e6ffu, text);
     }
     {
+        // Plugins' own text (host_text_show), where each plugin put it: the
+        // FPS counter's size, over its dark box unless the plugin asks for
+        // none. Text whose time is up goes here.
+        std::vector<PluginText> texts;
+        {
+            std::lock_guard<std::mutex> bl(g_banner_mu);
+            const auto now = std::chrono::steady_clock::now();
+            for (auto it = g_plugin_texts.begin(); it != g_plugin_texts.end();) {
+                if (it->second.until != std::chrono::steady_clock::time_point{} && now >= it->second.until) {
+                    it = g_plugin_texts.erase(it);
+                } else {
+                    texts.push_back(it->second);
+                    ++it;
+                }
+            }
+        }
+        if (!texts.empty()) {
+            float dw = 0.0f, dh = 0.0f;
+            {
+                std::lock_guard<std::mutex> ml(g_mouse_mu);
+                dw = g_display_w ? static_cast<float>(g_display_w) : 1920.0f;
+                dh = g_display_h ? static_cast<float>(g_display_h) : 1080.0f;
+            }
+            const float scale = 0.8f, line_h = 24.0f * scale + 4.0f;
+            for (const PluginText& t : texts) {
+                if (!(t.x >= 0.0f && t.x <= 1.0f && t.y >= 0.0f && t.y <= 1.0f)) continue;  // off the picture
+                std::vector<std::string> lines;
+                for (std::size_t at = 0;;) {
+                    const std::size_t end = t.text.find('\n', at);
+                    lines.push_back(t.text.substr(at, end == std::string::npos ? std::string::npos : end - at));
+                    if (end == std::string::npos) break;
+                    at = end + 1;
+                }
+                float w = 0.0f;
+                for (const std::string& line : lines) w = std::max(w, host_overlay_text_width(scale, line.c_str()));
+                const float h = line_h * static_cast<float>(lines.size()) - 4.0f;
+                float x = t.x * dw, y = t.y * dh;
+                if (t.flags & BB_TEXT_CENTER) {
+                    x -= w * 0.5f;
+                } else if (t.flags & BB_TEXT_RIGHT) {
+                    x -= w;
+                }
+                if (t.flags & BB_TEXT_BOTTOM) y -= h;
+                if (!(t.flags & BB_TEXT_NO_BOX)) {
+                    // The box fades with the text: 0xa0 at full alpha, as the FPS counter's.
+                    host_overlay_rect(x - 8.0f, y - 4.0f, w + 16.0f, h + 8.0f, (t.rgba & 0xffu) * 0xa0u / 0xffu);
+                }
+                for (std::size_t i = 0; i < lines.size(); ++i) {
+                    const float lw = host_overlay_text_width(scale, lines[i].c_str());
+                    const float lx = t.flags & BB_TEXT_CENTER ? x + (w - lw) * 0.5f : t.flags & BB_TEXT_RIGHT ? x + w - lw : x;
+                    host_overlay_text(lx, y + line_h * static_cast<float>(i), scale, t.rgba, lines[i].c_str());
+                }
+            }
+        }
+    }
+    {
         // A plugin's banner (host_message_show): centred in the upper third,
         // fading over its last half second.
         std::string text;
@@ -2095,6 +2161,27 @@ void host_message_show(const char* text, float seconds) {
     g_banner_text = text ? text : "";
     g_banner_until = std::chrono::steady_clock::now() +
                      std::chrono::milliseconds(static_cast<long long>((seconds > 0.0f ? seconds : 3.0f) * 1000.0f));
+}
+
+bool host_text_show(std::uint32_t id, const char* text, float x, float y, std::uint32_t rgba, float seconds,
+                    std::uint32_t flags) {
+    std::lock_guard<std::mutex> bl(g_banner_mu);
+    if (!text || !text[0]) {
+        g_plugin_texts.erase(id);
+        return true;
+    }
+    if (g_plugin_texts.size() >= 256 && !g_plugin_texts.count(id)) return false;
+    PluginText& t = g_plugin_texts[id];
+    t.text = text;
+    t.x = x;
+    t.y = y;
+    t.rgba = rgba;
+    t.flags = flags;
+    // A day at most: the end cannot overflow.
+    t.until = seconds > 0.0f ? std::chrono::steady_clock::now() +
+                                   std::chrono::milliseconds(static_cast<long long>(std::min(seconds, 86400.0f) * 1000.0f))
+                             : std::chrono::steady_clock::time_point{};
+    return true;
 }
 
 void host_text_entry_begin(const char* initial_utf8, unsigned max_chars, bool hidden, const char* label, TextCharset charset,

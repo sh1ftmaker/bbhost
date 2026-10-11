@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -778,6 +779,22 @@ int api_on_world_rules(const char* name, void (*fn)(const char*, void*), void* u
     return 0;
 }
 
+// Version 12: the plugins' own text over the game, drawn by the window's
+// pump with the host's overlay (host_text_show). The font has printable ASCII
+// only: a UTF-8 character becomes one '?' (its lead byte does; the
+// continuation bytes go), other control characters go.
+int api_overlay_text(std::uint32_t id, const char* text, float x, float y, std::uint32_t rgba, float seconds,
+                     std::uint32_t flags) {
+    if (!text || !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(seconds)) return 1;
+    std::string shown;
+    for (const char* c = text; *c && shown.size() < 256; ++c) {
+        const unsigned char u = static_cast<unsigned char>(*c);
+        if (u == '\n' || (u >= 0x20 && u < 0x7f)) shown += *c;
+        else if (u >= 0xc0) shown += '?';
+    }
+    return host_text_show(id, shown.c_str(), x, y, rgba, seconds, flags) ? 0 : 1;
+}
+
 const BbHostApi g_api = {
     BB_PLUGIN_API_VERSION, sizeof(BbHostApi), &api_log, &api_config, &api_data_dir, &api_mods_dir, &api_register_hle,
     &api_eboot_sha256, &api_eboot_is_109, &api_guest_addr, &api_read, &api_write, &api_patch, &api_hook,
@@ -790,6 +807,7 @@ const BbHostApi g_api = {
     &api_on_option, &api_on_action, &api_game_file, &api_overlay_file,
     &api_set_rules, &api_on_world_rules, &api_visitor,
     &api_replace_text,
+    &api_overlay_text,
 };
 
 std::string read_file(const std::string& path) {

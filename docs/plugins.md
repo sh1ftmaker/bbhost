@@ -79,7 +79,7 @@ log line. Everything a plugin logs is prefixed with `plugin:`.
 
 The API only ever grows. A plugin checks that `api->version` is at least the
 version whose calls it makes, and `api->size` for fields a newer host
-appended. The current version is 10 (`BB_PLUGIN_API_VERSION`).
+appended. The current version is 12 (`BB_PLUGIN_API_VERSION`).
 
 ## Addresses
 
@@ -151,6 +151,24 @@ gives the Binary Ninja address.
 - `on_option`, `on_action` (v9): callbacks for changes and button presses made
   in the in-game menu.
 - `show_message(text, seconds)` (v8): a banner over the game.
+- `overlay_text(id, text, x, y, rgba, seconds, flags)` (v12): text of the
+  plugin's own over the game, drawn every frame until `seconds` run out (0:
+  until replaced); the same id replaces it, empty text removes it. `x` and `y`
+  are a point of the game's picture, 0-1 from its top left, whatever the
+  resolution; `BB_TEXT_CENTER`, `BB_TEXT_RIGHT` and `BB_TEXT_BOTTOM` say which
+  point of the text that is, `BB_TEXT_NO_BOX` drops the dark box behind it.
+  `\n` starts a line; the font is printable ASCII, anything else shows as `?`.
+  All plugins share the ids, so use a range of your own. Any thread: a label
+  over another player's head is set again each frame with a short `seconds`,
+  so it goes by itself when the plugin stops placing it.
+
+  There is no world-space form. The host knows where the follow camera is and
+  its basis and field of view, but not the view and projection the frame was
+  rendered with: cutscenes, the debug camera and other cameras, and the camera
+  manager's blends between them all render through others, and the follow
+  camera's screen axes are not checked against a rendered frame. A plugin that
+  places text over the world projects the point itself and is the one to
+  check it.
 - `plugin_dir(name)` (v8): a data folder of the plugin's own.
 - `game_file(path, ...)` (v9): a game file by its `/app0` path, decompressed.
 - `overlay_file(name, path, data, size)` (v9): a file the game reads instead
@@ -180,7 +198,7 @@ C++ plugins can use `include/bbhost/`:
 
 | Header | Contents |
 |---|---|
-| `bbhost/sdk.hpp` | `bb::Plugin`: the API with lambdas (`every_frame`, `on_world_load`, `on_event_flag`), typed params, characters, flags, stats, messages, `gravity()`, `call("SYMBOL", args...)`; `bb::Rng` |
+| `bbhost/sdk.hpp` | `bb::Plugin`: the API with lambdas (`every_frame`, `on_world_load`, `on_event_flag`), typed params, characters, flags, stats, messages, on-screen `text()`, `gravity()`, `call("SYMBOL", args...)`; `bb::Rng` |
 | `bbhost/params.hpp` | a struct for every param row type and a tag for every table, generated from the game's own paramdefs, with offsets checked by `static_assert` |
 | `bbhost/engine/` | engine layouts and addresses for 1.09: characters, the world, matchmaking and sessions, GX, YEBIS and more |
 
