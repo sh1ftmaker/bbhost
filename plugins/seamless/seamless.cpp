@@ -11,12 +11,14 @@
 //   anywhere = true        # bells work where the game forbids them (cleared areas, the Dream's edges)
 //   stay_after_boss = true # cooperators stay when the boss dies
 //   keep_on_load = true    # the room outlives a map load instead of ending with it
+//   follow_host = true     # guests travel to the lamp the host travels to
 //
 // Every player in a session needs it: it announces itself in the session's
 // rules (X-BBHost-Ruleset), so the server only matches seamless players with
 // each other.
 #include "bbhost/sdk.hpp"
 
+#include <cstdlib>
 #include <cstring>
 
 extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
@@ -36,6 +38,7 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
     {BB_OPT_HEADING, nullptr, "Staying together"},
     {BB_OPT_BOOL, "stay_after_boss", "Stay after a boss", "Cooperators stay in the host's world when the boss dies.", "true"},
     {BB_OPT_BOOL, "keep_on_load", "Keep the session through loads", "A map load no longer ends the session.", "true"},
+    {BB_OPT_BOOL, "follow_host", "Follow the host", "When the host travels to a lamp, the guests travel there too.", "true"},
     {BB_OPT_END}};
 
 namespace {
@@ -48,6 +51,7 @@ bool g_free_bells = true;
 bool g_anywhere = true;
 bool g_stay_after_boss = true;
 bool g_keep_on_load = true;
+bool g_follow = true;
 
 bool option(const char* key, bool def) {
     const std::string v = g.api->config((std::string("seamless.") + key).c_str());
@@ -174,11 +178,189 @@ bool apply(const char* group, const std::vector<Patch>& patches) {
     return false;
 }
 
+// ---- The control channel ---------------------------------------------------
+// Small messages between the players' copies of this plugin, carried by the
+// game's own session as a WorldSession packet of a type the game never sends
+// or reads (0x1a, on its reliable channel: types above 6). The receiver files
+// it in that peer's queue for the type, where only this plugin takes it out.
+// A peer without the plugin keeps the few bytes queued and never reads them.
+namespace chan {
+
+constexpr std::uint64_t kWsomPtr = 0x593d6d0;         // WorldSessionObjectMan*
+constexpr std::uint64_t kSessMgrPtr = 0x5940290;      // SprjSessionManager*
+constexpr std::uint64_t kWorldChrManPtr = 0x593e878;  // WorldChrMan*
+constexpr std::uint64_t kSendPacket = 0x1b894e0;      // (wsom, route*, type, data, size) -> sent
+constexpr std::uint64_t kPopPeer = 0x1b89200;         // (wsom, route*, type, out, cap) -> bytes
+constexpr std::uint64_t kRouteIsLocal = 0x10a1670;    // (route*) -> bool
+constexpr std::uint64_t kRouteMatches = 0x10a1c70;    // (route*, route*) -> bool
+constexpr std::uint32_t kType = 0x1a;
+constexpr std::uint32_t kMagic = 0x434d4c53;  // "SLMC"
+constexpr std::size_t kMax = 0x400;
+
+enum Kind : std::uint8_t { Ping = 1, HostLampTravel = 2 };
+
+#pragma pack(push, 1)
+struct Header {
+    std::uint32_t magic;
+    std::uint8_t version, kind;
+    std::uint16_t seq;
+    std::int32_t sender_no;  // the sender's player number (PlayerIns +0x3b8)
+    std::uint16_t body_size, pad;
+};
+#pragma pack(pop)
+
+template <class T>
+T& at(std::uint8_t* p, std::size_t off) {
+    return *reinterpret_cast<T*>(p + off);
+}
+std::uint8_t* deref(std::uint64_t bn_slot) {
+    const std::uint64_t a = g.api->guest_addr(bn_slot);
+    return a ? *reinterpret_cast<std::uint8_t**>(a) : nullptr;
+}
+std::uint64_t call(std::uint64_t bn, std::uint64_t a = 0, std::uint64_t b = 0, std::uint64_t c = 0, std::uint64_t d = 0,
+                   std::uint64_t e = 0) {
+    BbCallRegs r{};
+    r.arg[0] = a, r.arg[1] = b, r.arg[2] = c, r.arg[3] = d, r.arg[4] = e;
+    return g.api->call_guest(bn, &r) == 0 ? r.ret : 0;
+}
+std::uint64_t u(const void* p) { return reinterpret_cast<std::uint64_t>(p); }
+
+// The session: role at SprjSessionManager +0x124 (3 the host, 6 a guest);
+// messages flow once WorldSessionObjectMan's state (+0x84) is 4, synced.
+struct Session {
+    std::uint8_t* wsom = nullptr;
+    std::uint8_t* mgr = nullptr;
+    int role = 0;
+    bool ready() const { return wsom && mgr && (role == 3 || role == 6) && at<std::int32_t>(wsom, 0x84) == 4; }
+    bool host() const { return role == 3; }
+};
+Session session() {
+    Session s;
+    s.wsom = deref(kWsomPtr);
+    s.mgr = deref(kSessMgrPtr);
+    if (s.mgr) s.role = at<std::int32_t>(s.mgr, 0x124);
+    return s;
+}
+
+// A peer's character in this world (null while it is still joining):
+// WorldChrMan's players (+0x38, 0x38 each, +0x30 of them; the first is the
+// local one) by their route (+0x3d8).
+std::uint8_t* player_of(std::uint8_t* route) {
+    std::uint8_t* wcm = deref(kWorldChrManPtr);
+    if (!wcm) return nullptr;
+    const std::uint32_t n = at<std::uint32_t>(wcm, 0x30);
+    std::uint8_t* entries = at<std::uint8_t*>(wcm, 0x38);
+    for (std::uint32_t i = 1; entries && i < n; ++i) {
+        std::uint8_t* pi = at<std::uint8_t*>(entries, i * 0x38);
+        if (pi && (call(kRouteMatches, u(pi + 0x3d8), u(route)) & 0xff)) return pi;
+    }
+    return nullptr;
+}
+
+// Every other member's route (SprjSessionManager +0xf8..+0x100, 0x20 each).
+template <class F>
+void for_each_peer(const Session& s, F&& f) {
+    std::uint8_t* it = at<std::uint8_t*>(s.mgr, 0xf8);
+    std::uint8_t* end = at<std::uint8_t*>(s.mgr, 0x100);
+    for (; it && it < end; it += 0x20) {
+        if (call(kRouteIsLocal, u(it)) & 0xff) continue;
+        f(it);
+    }
+}
+
+std::int32_t local_no() {
+    std::uint8_t* wcm = deref(kWorldChrManPtr);
+    std::uint8_t* entries = wcm ? at<std::uint8_t*>(wcm, 0x38) : nullptr;
+    std::uint8_t* me = entries ? at<std::uint8_t*>(entries, 0) : nullptr;
+    return me ? at<std::int32_t>(me, 0x3b8) : -1;
+}
+
+std::uint16_t g_seq;
+
+// To every member whose character is here (one still joining would only
+// queue it). The number of peers that took it. Main thread.
+int send_all(Kind kind, const void* body, std::uint16_t n) {
+    const Session s = session();
+    if (!s.ready() || sizeof(Header) + n > kMax) return 0;
+    static std::uint8_t buf[kMax];
+    const Header h{kMagic, 1, kind, ++g_seq, local_no(), n, 0};
+    std::memcpy(buf, &h, sizeof h);
+    if (n) std::memcpy(buf + sizeof h, body, n);
+    int sent = 0;
+    for_each_peer(s, [&](std::uint8_t* route) {
+        if (!player_of(route)) return;
+        if (call(kSendPacket, u(s.wsom), u(route), kType, u(buf), sizeof h + n) & 0xff) ++sent;
+    });
+    return sent;
+}
+
+// Takes every message that has arrived, oldest first: fn(header, body).
+// Main thread (the queues fill in the game's own session update there).
+template <class F>
+void poll(F&& fn) {
+    const Session s = session();
+    if (!s.ready()) return;
+    static std::uint8_t buf[0x6400];  // as large as any message, so none is skipped
+    for_each_peer(s, [&](std::uint8_t* route) {
+        for (int i = 0; i < 32; ++i) {
+            const auto n = static_cast<std::int32_t>(call(kPopPeer, u(s.wsom), u(route), kType, u(buf), sizeof buf));
+            if (n <= 0) break;
+            Header h;
+            if (static_cast<std::size_t>(n) < sizeof h) continue;
+            std::memcpy(&h, buf, sizeof h);
+            if (h.magic != kMagic || sizeof h + h.body_size > static_cast<std::size_t>(n)) continue;
+            fn(h, buf + sizeof h);
+        }
+    });
+}
+
+}  // namespace chan
+
+// ---- Following the host ------------------------------------------------------
+// The host's lamp travel (WarpNextStage_Bonfire, 0x172e050: the lamps' and
+// the Dream's headstones' travel, by ReturnPointParam row) goes to every
+// guest, who travels to the same lamp: everyone loads the same map, and the
+// session (keep_on_load) carries on there.
+constexpr std::uint64_t kWarpBonfire = 0x172e050;
+const std::uint8_t kWarpBonfirePrologue[14] = {0x55, 0x48, 0x89, 0xe5, 0x48, 0x63, 0xc6,
+                                               0x48, 0x69, 0xc8, 0x89, 0xb5, 0xf8, 0x14};
+std::int32_t g_follow_to = 0;  // a lamp the host went to, for this guest to follow
+
+int on_warp_bonfire(BbHookCtx* ctx, void*) {
+    const auto rp = static_cast<std::int32_t>(ctx->arg[1]);
+    const chan::Session s = chan::session();
+    if (s.ready() && s.host()) {
+        const int n = chan::send_all(chan::HostLampTravel, &rp, sizeof rp);
+        g.log("seamless: the host travels to lamp %d; told %d guest%s", rp, n, n == 1 ? "" : "s");
+    }
+    return 0;
+}
+
+void on_message(const chan::Header& h, const std::uint8_t* body) {
+    switch (h.kind) {
+    case chan::Ping: {
+        std::uint32_t count = 0;
+        if (h.body_size >= sizeof count) std::memcpy(&count, body, sizeof count);
+        g.log("seamless: ping %u from player %d (seq %u)", count, h.sender_no, h.seq);
+        break;
+    }
+    case chan::HostLampTravel:
+        if (g_follow && h.body_size >= sizeof g_follow_to && !chan::session().host()) {
+            std::memcpy(&g_follow_to, body, sizeof g_follow_to);
+            g.log("seamless: the host travels to lamp %d; following", g_follow_to);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
 void read_options() {
     g_free_bells = option("free_bells", true);
     g_anywhere = option("anywhere", true);
     g_stay_after_boss = option("stay_after_boss", true);
     g_keep_on_load = option("keep_on_load", true);
+    g_follow = option("follow_host", true);
 }
 
 }  // namespace
@@ -212,5 +394,30 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
             }
         });
     }
+    // The channel: what arrives each frame, and a lamp for a guest to follow.
+    // BBHOST_SEAMLESS_PING=1 sends a numbered ping every two seconds (the
+    // channel's test).
+    static const bool ping = [] {
+        const char* e = std::getenv("BBHOST_SEAMLESS_PING");
+        return e && e[0] == '1';
+    }();
+    g.every_frame([] {
+        chan::poll(on_message);
+        if (g_follow_to) {
+            const std::int32_t rp = g_follow_to;
+            g_follow_to = 0;
+            const int r = g.api->lamp_warp(rp);
+            g.log("seamless: lamp travel to %d after the host: %s", rp, r == 0 ? "queued" : "refused");
+        }
+        static std::uint32_t frame, pings;
+        if (ping && ++frame % 120 == 0) {
+            ++pings;
+            const int n = chan::send_all(chan::Ping, &pings, sizeof pings);
+            if (n) g.log("seamless: ping %u sent to %d", pings, n);
+        }
+    });
+    if (g_follow && api->hook2(kWarpBonfire, kWarpBonfirePrologue, sizeof kWarpBonfirePrologue, on_warp_bonfire, nullptr) != 0)
+        g.log("seamless: the lamp travel at 0x%llx has other bytes; guests will not follow",
+              static_cast<unsigned long long>(kWarpBonfire));
     return 0;
 }

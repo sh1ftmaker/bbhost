@@ -20,6 +20,12 @@
  *    count of other players logged as it changes, to see whether the
  *    session survives the load.
  *
+ * 5. COOP_BELL_GATE=<file>: the bell waits until that file exists (pair.ps1
+ *    makes it when the guest's sign is on the server, so the host's first
+ *    search finds it instead of waiting a minute for the next).
+ * The session's role and member count (SprjSessionManager) are logged as
+ * they change; after a reload a RESULT line says whether it survived.
+ *
  * Build (llvm-mingw):
  *   clang --target=x86_64-w64-mingw32 -shared -O2 -I<bbhost-src>/include -o coop_lamp.dll coop_lamp.c
  */
@@ -42,20 +48,29 @@ static double g_bell_at = 30.0;
 static double g_last_scan = 0;
 static char g_effects[1024];
 static int g_goods_logged = 0;
-static double g_reload_after = 0, g_others_since = 0;
-static int g_reload_done = 0, g_others = -1;
+static double g_reload_after = 0, g_others_since = 0, g_reload_at = 0;
+static int g_reload_done = 0, g_others = -1, g_result_done = 0;
+static char g_gate[512];
+static char g_session[64];
 
-/* Other players in the world: characters with no NpcParam row that are not
- * the main player. */
-static int count_others(void) {
-    BbChr chrs[256];
-    size_t n = 0;
-    if (api->chr_list(chrs, 256, &n) != 0) return -1;
-    int others = 0;
-    for (size_t i = 0; i < n && i < 256; ++i)
-        if (!chrs[i].is_player && chrs[i].npc_param == -1) ++others;
-    return others;
+/* The session as SprjSessionManager (pointer at 0x5940290) holds it: its
+ * role (+0x124: 3 host, 6 client) and its member routes (+0xf8..+0x100, 0x20
+ * each). 0 when there is none. */
+static int session_members(int* role) {
+    static int warned;
+    const uint64_t slot = api->guest_addr(0x5940290);
+    *role = 0;
+    if (!slot) {
+        if (!warned++) api->log("coop_lamp: guest_addr(0x5940290) is 0");
+        return 0;
+    }
+    const uint8_t* mgr = *(uint8_t* const*)(uintptr_t)slot;
+    if (!mgr) return 0;
+    *role = *(const int32_t*)(mgr + 0x124);
+    const uint64_t begin = *(const uint64_t*)(mgr + 0xf8), end = *(const uint64_t*)(mgr + 0x100);
+    return end > begin ? (int)((end - begin) / 0x20) : 0;
 }
+
 
 static double now_s(void) {
     struct timespec ts;
@@ -114,6 +129,13 @@ static void on_frame(void* user) {
         g_in_dream_since = 0;
         if (!g_world_since) {
             g_world_since = t;
+            /* A load after another member was here (this side's reload, or
+             * following the host's): watch whether the session is still on. */
+            if (g_others_since && !g_reload_done) {
+                g_reload_done = 1;
+                g_reload_at = t;
+                api->log("coop_lamp: a load with the session on; watching it");
+            }
             api->log("coop_lamp: in block %08x", (unsigned)block);
             if (!g_goods_logged) {
                 g_goods_logged = 1;
@@ -125,21 +147,43 @@ static void on_frame(void* user) {
             g_last_scan = t;
             chr = player_ins();
             if (chr) scan_effects(chr);
-            const int others = count_others();
+            int role = 0;
+            const int members = session_members(&role);
+            char sess[64];
+            snprintf(sess, sizeof sess, "role %d, %d members", role, members);
+            if (strcmp(sess, g_session) != 0) {
+                api->log("coop_lamp: session: %s (block %08x)", sess, (unsigned)block);
+                strcpy(g_session, sess);
+            }
+            if (g_reload_done && !g_result_done && t - g_reload_at > 10) {
+                if (members >= 2) {
+                    g_result_done = 1;
+                    api->log("coop_lamp: RESULT the session survived the load: %s, %.0f s after the reload", sess,
+                             t - g_reload_at);
+                } else if (t - g_reload_at > 60) {
+                    g_result_done = 1;
+                    api->log("coop_lamp: RESULT the session did not survive the load: %s", sess);
+                }
+            }
+            const int others = members > 1 ? members - 1 : 0;
             if (others != g_others) {
-                api->log("coop_lamp: other players in the world: %d (block %08x)", others, (unsigned)block);
+                api->log("coop_lamp: other session members: %d (block %08x)", others, (unsigned)block);
                 g_others = others;
             }
             if (others > 0 && !g_others_since) g_others_since = t;
             if (g_reload_after > 0 && !g_reload_done && g_others_since && t - g_others_since >= g_reload_after) {
                 g_reload_done = 1;
+                g_reload_at = t;
                 int r = api->lamp_warp(g_rp);
                 api->log("coop_lamp: reload: lamp_warp(%d) with %d other players -> %s", (int)g_rp, others,
                          r == 0 ? "queued" : "refused");
             }
             else if (!g_effects[0]) { api->log("coop_lamp: no player in chr_list yet"); strcpy(g_effects, "?"); }
         }
-        if (!g_bell_done && (g_bell_goods || g_bell_sp) && t - g_world_since >= g_bell_at) {
+        FILE* gate = 0;
+        const int gate_open = !g_gate[0] || ((gate = fopen(g_gate, "rb")) != 0);
+        if (gate) fclose(gate);
+        if (!g_bell_done && (g_bell_goods || g_bell_sp) && t - g_world_since >= g_bell_at && gate_open) {
             g_bell_done = 1;
             int sp = g_bell_sp;
             if (!sp) {
@@ -182,6 +226,7 @@ BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* a) {
     if ((e = getenv("COOP_BELL_SPEFFECT")) && *e) g_bell_sp = atoi(e);
     if ((e = getenv("COOP_BELL_AT")) && *e) g_bell_at = atof(e);
     if ((e = getenv("COOP_RELOAD_AFTER")) && *e) g_reload_after = atof(e);
+    if ((e = getenv("COOP_BELL_GATE")) && *e) snprintf(g_gate, sizeof g_gate, "%s", e);
     a->on_frame(on_frame, 0);
     a->log("coop_lamp: loaded (return point %d, bell goods %d speffect %d at %.0f s)", (int)g_rp, g_bell_goods,
            g_bell_sp, g_bell_at);

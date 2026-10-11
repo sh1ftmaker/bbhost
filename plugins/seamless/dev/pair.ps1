@@ -25,7 +25,7 @@
   powershell -ExecutionPolicy Bypass -File pair.ps1 -Only host -Seconds 120
 #>
 param(
-    [int]$Seconds = 480,                 # kill everything after this long (0 = wait for Enter)
+    [int]$Seconds = 300,                 # kill everything after this long at most (0 = wait for Enter)
     [string]$Only = "",                  # "host" or "guest": start just that one
     [switch]$Third,                      # also a second guest (GuestHunter2)
     [string]$Bbhost = "C:\Users\shift\Desktop\Bloodborne\bbhost-win-v0.2.18\bbhost.exe",
@@ -35,7 +35,7 @@ param(
     [string]$Python = "python",
     # Title (60 fps, intro skipped): any button, Down x4 to "Log In" (the
     # game starts offline; Log In fetches ss.info and logs in), then Continue.
-    [string]$TitlePress = "8:cross,11:down:150,12:down:150,13:down:150,14:down:150,15.5:cross:150,24:cross:150",
+    [string]$TitlePress = "8:cross,11:down:150,12:down:150,13:down:150,14:down:150,15.5:cross:150,24:cross:150,40:cross:150,43:circle:150",
     # Extra presses after the title, per role (BBHOST_AUTOPRESS syntax, appended).
     [string]$HostPress = "",
     [string]$GuestPress = "",
@@ -55,9 +55,13 @@ param(
     # the EquipParamGoods id whose refId SpEffect is applied, per role (0 = off).
     [int]$HostBell = 200,                 # Beckoning Bell (refId SpEffect 9000)
     [int]$GuestBell = 205,                # Small Resonant Bell (SpEffect 9005)
-    [double]$BellAt = 30,                # guest: seconds after reaching the lamp
-    [double]$HostBellAt = 60,
+    [double]$BellAt = 3,                 # guest: seconds after reaching the lamp
+    [double]$HostBellAt = 3,              # host: after reaching the lamp, once the guest's sign is up
+    [int]$HoldAfterJoin = 15,            # without -ReloadAfter: stop this long after both report the join
+    [double]$LampDelay = 2,              # seconds in the Dream before the lamp travel
     [int]$ReloadAfter = 0,                # both: lamp travel again this many s after the other player shows up
+    [switch]$Ping,                       # BBHOST_SEAMLESS_PING=1: the seamless plugin's channel test
+    [switch]$HostOnlyReload,             # only the host reloads (-ReloadAfter); the guest follows it or not
     [switch]$SummonInvite                # guest: BBHOST_SUMMON_INVITE=1 (bbhost hands the game the server's guest_invite as its type-1 item)
 )
 
@@ -156,7 +160,7 @@ $pluginToml
 $common = @{
     BBHOST_SETUP_WINDOW = "0"; BBHOST_SKIP_INTRO = "1"; BBHOST_PRESENT_MODE = "fifo";
     BBHOST_NP_TRACE = "1"; BBHOST_TEST_INSIGHT = "$Insight"; BBHOST_GAME_FPS = "60";
-    BBHOST_TEST_WARP = "1"; BBHOST_TEST_UNLOCK_LAMPS = "1"; COOP_LAMP_RP = "$LampRp"; COOP_RELOAD_AFTER = "$ReloadAfter"
+    BBHOST_TEST_WARP = "1"; BBHOST_TEST_UNLOCK_LAMPS = "1"; COOP_LAMP_RP = "$LampRp"; COOP_RELOAD_AFTER = "$ReloadAfter"; COOP_LAMP_DELAY = "$LampDelay"; BBHOST_SEAMLESS_PING = $(if ($Ping) { "1" } else { "0" })
 }
 
 function Start-Instance($inst, [hashtable]$envs) {
@@ -186,6 +190,15 @@ function Press([string]$extra) { if ($extra) { "$TitlePress,$extra" } else { $Ti
 function Get-FreeCommitGB {
     $o = Get-CimInstance Win32_OperatingSystem
     return [math]::Round($o.FreeVirtualMemory / 1MB, 1)
+}
+# Any error after this point: stop what this script started, never leave
+# instances behind.
+trap {
+    Write-Host "error: $_"
+    foreach ($q in $procs) { if ($q -and -not $q.HasExited) { & taskkill /PID $q.Id /T /F | Out-Null } }
+    if ($srv -and -not $srv.HasExited) { & taskkill /PID $srv.Id /T /F | Out-Null }
+    "ABORTED: $_" | Out-File -Append -FilePath "$Runerdict.txt"
+    exit 3
 }
 function Stop-All([string]$why) {
     foreach ($q in $procs) { if (-not $q.HasExited) { & taskkill /PID $q.Id /T /F | Out-Null } }
@@ -222,6 +235,7 @@ function Wait-Healthy($inst, $p, [int]$Sec = 45) {
 $procs = @()
 $guestEnv = @{ BBHOST_NP_TEST = $GuestTest; BBHOST_AUTOPRESS = (Press $GuestPress); SDL_AUDIO_DRIVER = "dummy";
     COOP_BELL = "$GuestBell"; COOP_BELL_AT = "$BellAt" }
+if ($HostOnlyReload) { $guestEnv["COOP_RELOAD_AFTER"] = "0" }
 if ($SummonInvite) { $guestEnv["BBHOST_SUMMON_INVITE"] = "1" }
 if (-not $GuestRenders) { $guestEnv["BBHOST_RENDER_MIN"] = "1" }
 # The host first: it renders, so it should get the memory first.
@@ -229,7 +243,7 @@ if ($Only -ne "guest") {
     if ($MinCommitGB -gt 0) { Assert-Commit "host" }
     $h = New-Instance "host" "HostHunter" 9307
     $hp = Start-Instance $h @{ BBHOST_NP_TEST = $HostTest; BBHOST_AUTOPRESS = (Press $HostPress);
-        COOP_BELL = "$HostBell"; COOP_BELL_AT = "$HostBellAt" }
+        COOP_BELL = "$HostBell"; COOP_BELL_AT = "$HostBellAt"; COOP_BELL_GATE = (Join-Path $Run "guest-sign") }
     $procs += $hp
     Wait-Healthy $h $hp
 }
@@ -256,14 +270,30 @@ if ($Seconds -gt 0) {
     while (((Get-Date) - $t0).TotalSeconds -lt $Seconds) {
         if (-not ($procs | Where-Object { -not $_.HasExited })) { break }
         Start-Sleep -Seconds 2
-        # Both sides in the room: keep them together a little, then stop
-        # (-KeepRunning leaves them up until -Seconds).
-        if (-not $joinedAt -and -not $Only -and -not $KeepRunning) {
+        # The guest's sign is on the server: the host may ring (its search
+        # then finds the sign at once instead of a minute later).
+        $gate = Join-Path $Run "guest-sign"
+        if (-not (Test-Path $gate) -and (Select-String -Path (Join-Path $Run "server.log") -Pattern "summon_messenger/create" -Quiet -ErrorAction SilentlyContinue)) {
+            New-Item -ItemType File $gate | Out-Null
+            Write-Host ("guest's sign is up after {0:N0} s; the host rings" -f ((Get-Date) - $t0).TotalSeconds)
+        }
+        if ($Only -or $KeepRunning) { continue }
+        if ($ReloadAfter -gt 0) {
+            # Stop once both sides say whether the session survived the reload.
+            $results = @("host", "guest") | Where-Object {
+                Select-String -Path (Join-Path $Run "$_\bbhost.log") -Pattern "coop_lamp: RESULT" -Quiet -ErrorAction SilentlyContinue }
+            if (@($results).Count -ge 2) { Write-Host "both sides have a result"; break }
+            if (@($results).Count -eq 1 -and -not $joinedAt) { $joinedAt = Get-Date }
+            if ($joinedAt -and ((Get-Date) - $joinedAt).TotalSeconds -gt 60) { break }
+            continue
+        }
+        # Both sides in the room: keep them together a little, then stop.
+        if (-not $joinedAt) {
             $hj = Select-String -Path (Join-Path $Run "host\bbhost.log") -Pattern "np: member \d+ \(.*\) joined room" -Quiet -ErrorAction SilentlyContinue
             $gj = Select-String -Path (Join-Path $Run "guest\bbhost.log") -Pattern "np: joined room \d+" -Quiet -ErrorAction SilentlyContinue
-            if ($hj -and $gj) { $joinedAt = Get-Date; Write-Host "both sides report the join; stopping in 60 s" }
+            if ($hj -and $gj) { $joinedAt = Get-Date; Write-Host ("both sides report the join after {0:N0} s; stopping in $HoldAfterJoin s" -f ((Get-Date) - $t0).TotalSeconds) }
         }
-        if ($joinedAt -and ((Get-Date) - $joinedAt).TotalSeconds -gt 60) { break }
+        if ($joinedAt -and ((Get-Date) - $joinedAt).TotalSeconds -gt $HoldAfterJoin) { break }
     }
 } else {
     Read-Host "press Enter to stop the instances and the server"
@@ -277,4 +307,8 @@ $hostJoin = if (Test-Path $hl) { Select-String -Path $hl -Pattern "np: member \d
 $guestJoin = if (Test-Path $gl) { Select-String -Path $gl -Pattern "np: joined room \d+" } else { $null }
 "host:  " + $(if ($hostJoin) { $hostJoin[0].Line.Trim() } else { "no member joined" }) | Tee-Object -FilePath "$Run\verdict.txt"
 "guest: " + $(if ($guestJoin) { $guestJoin[0].Line.Trim() } else { "did not join a room" }) | Tee-Object -FilePath "$Run\verdict.txt" -Append
+foreach ($r in "host", "guest") {
+    $res = Select-String -Path (Join-Path $Run "$r\bbhost.log") -Pattern "coop_lamp: RESULT.*" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($res) { "${r}: " + $res.Matches[0].Value | Tee-Object -FilePath "$Run\verdict.txt" -Append }
+}
 Write-Host "logs: $Run"

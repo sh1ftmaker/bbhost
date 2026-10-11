@@ -81,3 +81,25 @@ powershell -ExecutionPolicy Bypass -File pair.ps1 -Seamless -KeepRunning -Second
    - Keep `BB_PLUGIN_OPT_IN | BB_PLUGIN_GAMEPLAY`.
    - Credit shadp2p for the offsets in the code comments.
    - Note that it hasn't been tested on Linux.
+
+## Update (2026-10-10, evening)
+
+- **Control channel works.** It's in seamless.cpp (`namespace chan`). Messages go as WorldSession packet type 0x1a over the game's own reliable channel. Design and addresses are in `re/channel/channel.md`.
+  - Run `20261010-230118`: pings went both ways in order, host to guest and guest to host. Test it with `BBHOST_SEAMLESS_PING=1` (`pair.ps1 -Ping`).
+  - **Address catch:** the WSOM, SprjSessionManager and WorldChrMan "SINGLETON_PTR"s are pointer slots: BN 0x593d6d0, 0x5940290 and 0x593e878. Dereference them through `guest_addr`. `api->read` returned nothing for them.
+- **Follow the host works as far as the hand-off.**
+  - The plugin hooks WarpNextStage_Bonfire (BN 0x172e050, 14-byte prologue) and sends the host's lamp to the guest.
+  - The guest gets it and queues `lamp_warp` to the same lamp.
+- **The session does NOT survive the load yet.**
+  - The host's lamp travel made the guest leave: `np: member 2 left (leave_room)`, and both sides ended at role 0.
+  - `keep_on_load` (the per-area payload destructor) is not the path that ends it here.
+  - Likely cause: the guest's own lamp travel goes through `SessionWorldTransition` (0x17cde30), which calls BeginLeaveSession unless GameStateMan+0x1592 != 0 (see `re/session-end/session-end.md`). The host's side may also be the world-transition leave at 0x1d3c657 or 0x1d39876.
+  - **Next:** trace which BeginLeaveSession caller fires on each side. Hook2 BeginLeaveSession (0x22d07a0) in log-only mode and log the return address, if hook2 can see it; otherwise hook each candidate caller. Then gate it while a seamless follow is in progress.
+  - The fallback is to let it end and re-summon automatically after the load (the hybrid plan).
+- **The test runner is event-driven now:**
+  - The host's bell waits for the guest's sign (`COOP_BELL_GATE`).
+  - The run stops once both sides log a `coop_lamp: RESULT`.
+  - A trap kills the instances if the script errors.
+  - A run takes about 2.5 minutes (it was 7). The join comes about 40 s after the guest's sign.
+  - Command: `pair.ps1 -Seamless -Ping -ReloadAfter 15 -HostOnlyReload -MinCommitGB 8.5`
+- **The test plugin** (`coop_lamp`) logs the session role and member count from SprjSessionManager, and after any load it logs whether the session is still on.
