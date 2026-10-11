@@ -150,6 +150,15 @@ const std::vector<Patch> kHostDeath = {
     {"host dead broadcast", 0x17816d7, {0x4c, 0x89, 0xf7}, {0xe8, 0x84, 0xd2, 0xfa, 0xff}, {0x0f, 0x1f, 0x44, 0x00, 0x00}},
 };
 
+// A guest's death sends it home: PartyGhostDeath (0x1781fd0) tells the peers
+// it left (CustomLuaCallStart(4063), OnGameLeave, at 0x178201b) and
+// PartyGhostDeath_2 loads the guest's own world. Without the first the guest
+// stays a member; the plugin points the second at the host's lamp
+// (on_world_transition), so the guest comes back next to the host.
+const std::vector<Patch> kGuestDeath = {
+    {"guest left on death", 0x178201b, {0x48, 0x89, 0xdf}, {0xe8, 0x20, 0xcd, 0xfa, 0xff}, {0x0f, 0x1f, 0x44, 0x00, 0x00}},
+};
+
 // A map load ends the session: the per-area event payload's destructor
 // (0x1d470f0) calls SprjSessionManager's BeginLeaveSession (0x22d07a0,
 // reason 0xff000023). In its place it calls the manager's "a matching
@@ -210,7 +219,7 @@ constexpr std::uint32_t kType = 0x1a;
 constexpr std::uint32_t kMagic = 0x434d4c53;  // "SLMC"
 constexpr std::size_t kMax = 0x400;
 
-enum Kind : std::uint8_t { Ping = 1, HostLampTravel = 2, HostRespawn = 3 };
+enum Kind : std::uint8_t { Ping = 1, HostLampTravel = 2, HostRespawn = 3, HostReturnPoint = 4, PeerReloaded = 5 };
 
 #pragma pack(push, 1)
 struct Header {
@@ -291,8 +300,10 @@ std::int32_t local_no() {
 std::uint16_t g_seq;
 
 // To every member whose character is here (one still joining would only
-// queue it). The number of peers that took it. Main thread.
-int send_all(Kind kind, const void* body, std::uint16_t n) {
+// queue it) - or, with `any`, to every member of the room (one back from a
+// load of its own, whose character is not made here yet). The number of
+// peers that took it. Main thread.
+int send_all(Kind kind, const void* body, std::uint16_t n, bool any = false) {
     const Session s = session();
     if (!s.ready() || sizeof(Header) + n > kMax) return 0;
     static std::uint8_t buf[kMax];
@@ -301,7 +312,7 @@ int send_all(Kind kind, const void* body, std::uint16_t n) {
     if (n) std::memcpy(buf + sizeof h, body, n);
     int sent = 0;
     for_each_peer(s, [&](std::uint8_t* route) {
-        if (!player_of(route)) return;
+        if (!any && !player_of(route)) return;
         if (call(kSendPacket, u(s.wsom), u(route), kType, u(buf), sizeof h + n) & 0xff) ++sent;
     });
     return sent;
@@ -338,6 +349,12 @@ constexpr std::uint64_t kWarpBonfire = 0x172e050;
 const std::uint8_t kWarpBonfirePrologue[14] = {0x55, 0x48, 0x89, 0xe5, 0x48, 0x63, 0xc6,
                                                0x48, 0x69, 0xc8, 0x89, 0xb5, 0xf8, 0x14};
 std::int32_t g_follow_to = 0;  // a lamp the host went to, for this guest to follow
+int g_reinsert_wait = 0;   // frames until the kept tasks are sent back to Create (0: nothing to do)
+int g_reinsert_tries = 0;  // seconds of retries left while the world is not ready for it
+std::int32_t g_host_rp = 0, g_host_rp_anim = 0;  // the host's lamp (its respawn point), as a guest knows it
+int g_guest_respawn = 0;      // frames until a guest that died and came back clears its death state
+std::uint64_t g_own_rp = 0;   // the guest's own respawn point (GameStateMan +0x1528), kept while in a party
+bool g_own_rp_saved = false;
 std::string g_host_name;  // the host's online id, while a guest in a party
 int g_following = 0;  // frames left in which this guest's own world transition is the follow
 
@@ -368,6 +385,19 @@ void on_message(const chan::Header& h, const std::uint8_t* body) {
         g.log("seamless: ping %u from player %d (seq %u)", count, h.sender_no, h.seq);
         break;
     }
+    case chan::HostReturnPoint:
+        if (h.body_size >= 8 && !chan::session().host()) {
+            std::memcpy(&g_host_rp, body, 4);
+            std::memcpy(&g_host_rp_anim, body + 4, 4);
+        }
+        break;
+    case chan::PeerReloaded:
+        // A member came back from a load of its own: its character here was
+        // made for the world it left.
+        g_reinsert_wait = 300;
+        g_reinsert_tries = 60;
+        g.log("seamless: player %d loaded again; making its character again", h.sender_no);
+        break;
     case chan::HostRespawn:
         if (g_keep_on_death && h.body_size >= sizeof g_follow_to && !chan::session().host()) {
             std::memcpy(&g_follow_to, body, sizeof g_follow_to);
@@ -378,6 +408,7 @@ void on_message(const chan::Header& h, const std::uint8_t* body) {
     case chan::HostLampTravel:
         if (g_follow && h.body_size >= sizeof g_follow_to && !chan::session().host()) {
             std::memcpy(&g_follow_to, body, sizeof g_follow_to);
+            g_host_rp = g_follow_to;
             g.log("seamless: the host travels to lamp %d; following", g_follow_to);
         }
         break;
@@ -406,6 +437,7 @@ std::uint64_t caller_bn(const BbHookCtx* ctx) {
 
 bool g_trace = false;
 constexpr std::uint64_t kFromHostDeathRespawn = 0x1781ee3;  // SoloPlayDeath_2's call returns here
+constexpr std::uint64_t kFromGuestDeath = 0x1782668;        // PartyGhostDeath_2's call returns here
 
 int on_world_transition(BbHookCtx* ctx, void*) {
     const chan::Session s = chan::session();
@@ -417,6 +449,27 @@ int on_world_transition(BbHookCtx* ctx, void*) {
             const int n = chan::send_all(chan::HostRespawn, &rp, sizeof rp);
             g.log("seamless: the host died; it respawns at lamp %d (keeps the room: %d); told %d guest%s", rp,
                   chan::at<std::uint8_t>(gsm, 0x1592), n, n == 1 ? "" : "s");
+        }
+    }
+    // A guest died: instead of its own world, PartyGhostDeath_2's load goes
+    // to the host's lamp (the stores lamp travel makes: GameStateMan +0x0c
+    // map, +0x10 entity, +0x1528 return point and anim, +0x1524 use it, not
+    // +0x1520 "going home"), keeping the room. GameDataMan +0x70, which the
+    // chain has set, makes the load revive the player at full HP.
+    if (g_keep_on_death && s.ready() && s.role == 6 && g_host_rp > 0 && caller_bn(ctx) == kFromGuestDeath) {
+        if (std::uint8_t* gsm = chan::deref(kGameStateManPtr)) {
+            const std::int32_t row = g_host_rp;
+            chan::at<std::int32_t>(gsm, 0x1520) = 0;
+            chan::at<std::uint32_t>(gsm, 0x0c) = static_cast<std::uint32_t>(row / 100000) << 24 |
+                                                 static_cast<std::uint32_t>((row / 10000) % 10) << 16;
+            chan::at<std::int32_t>(gsm, 0x10) = row;
+            chan::at<std::int32_t>(gsm, 0x1528) = row;
+            chan::at<std::int32_t>(gsm, 0x152c) = g_host_rp_anim;
+            chan::at<std::int32_t>(gsm, 0x1524) = 1;
+            g_following = 1;  // and keep the room, below
+            g_guest_respawn = 600;
+            g.message("You fell - back to " + (g_host_name.empty() ? std::string("the host") : g_host_name) + "'s lamp");
+            g.log("seamless: the guest died; it comes back at the host's lamp %d", row);
         }
     }
     if (g_following && s.mgr && s.role == 6) {
@@ -443,6 +496,45 @@ int trace_hook(BbHookCtx* ctx, void* what) {
 
 int g_party = 0;          // other members in the room
 
+// Once a frame: a host tells its guests where its lamp is (every five
+// seconds while it changes or a guest is new); a guest back from its death
+// load clears what the death left - flags 4000/4047, the event manager's
+// death state, the event state - and tells the host to make its character
+// again.
+constexpr std::uint64_t kSprjEventManPtr = 0x593b108;
+constexpr std::uint64_t kEventStatePtr = 0x593b0d8;
+std::uint32_t g_event_state_alive = 0;
+
+void guest_death_frame() {
+    static std::uint32_t frame;
+    ++frame;
+    const chan::Session s = chan::session();
+    std::uint8_t* gsm = chan::deref(kGameStateManPtr);
+    if (s.ready() && s.host() && gsm && frame % 300 == 0) {
+        const std::int32_t rp[2] = {chan::at<std::int32_t>(gsm, 0x1528), chan::at<std::int32_t>(gsm, 0x152c)};
+        chan::send_all(chan::HostReturnPoint, rp, sizeof rp);
+    }
+    if (s.ready() && s.role == 6 && frame % 60 == 0 && !g_guest_respawn) {
+        std::int64_t hp = 0;
+        if (g.api->player_stat_get("hp", &hp) == 0 && hp > 0)
+            if (std::uint8_t* es = chan::deref(kEventStatePtr)) g_event_state_alive = chan::at<std::uint32_t>(es, 0);
+    }
+    if (g_guest_respawn > 0 && --g_guest_respawn == 0) {
+        std::int64_t hp = 0;
+        if (g.api->player_stat_get("hp", &hp) != 0 || hp <= 0) {
+            g_guest_respawn = 60;  // not back yet
+            return;
+        }
+        g.api->event_flag_set(4000, 0);
+        g.api->event_flag_set(4047, 0);
+        if (std::uint8_t* sem = chan::deref(kSprjEventManPtr))
+            if (std::uint8_t* d = chan::at<std::uint8_t*>(sem, 0x10)) chan::at<std::int32_t>(d, 8) = 0;
+        if (std::uint8_t* es = chan::deref(kEventStatePtr)) chan::at<std::uint32_t>(es, 0) = g_event_state_alive;
+        const int n = chan::send_all(chan::PeerReloaded, nullptr, 0, true);
+        g.log("seamless: back from the death load at %lld HP; told %d", static_cast<long long>(hp), n);
+    }
+}
+
 void on_session(const BbSessionEvent* ev, void*) {
     const std::string who = ev->online_id && ev->online_id[0] ? ev->online_id : "A hunter";
     switch (ev->kind) {
@@ -451,6 +543,10 @@ void on_session(const BbSessionEvent* ev, void*) {
         break;
     case BB_SESSION_JOINED:
         g_party = 0;
+        if (std::uint8_t* gsm = chan::deref(kGameStateManPtr)) {
+            g_own_rp = chan::at<std::uint64_t>(gsm, 0x1528);
+            g_own_rp_saved = true;
+        }
         break;
     case BB_SESSION_MEMBER_JOINED:
         ++g_party;
@@ -466,6 +562,11 @@ void on_session(const BbSessionEvent* ev, void*) {
     case BB_SESSION_KICKED:
         if (g_party > 0) g.message("The party has ended");
         g_party = 0;
+        if (g_own_rp_saved) {
+            if (std::uint8_t* gsm = chan::deref(kGameStateManPtr)) chan::at<std::uint64_t>(gsm, 0x1528) = g_own_rp;
+            g_own_rp_saved = false;
+        }
+        g_host_rp = 0;
         g_host_name.clear();
         break;
     default:
@@ -529,8 +630,6 @@ bool new_task(const chan::Session& s, std::uint8_t* mpm, std::uint8_t* route) {
     return true;
 }
 
-int g_reinsert_wait = 0;   // frames until the kept tasks are sent back to Create (0: nothing to do)
-int g_reinsert_tries = 0;  // seconds of retries left while the world is not ready for it
 
 int on_destroy_all_tasks(BbHookCtx* ctx, void*) {
     const std::uint64_t base = g.api->guest_addr(0x400000);
@@ -614,6 +713,7 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
     if (g_stay_after_boss) apply("stay after a boss", kStayAfterBoss);
     if (g_keep_on_load) apply("keep the session through loads", kKeepOnLoad);
     if (g_keep_on_death) apply("keep the party when the host dies", kHostDeath);
+    if (g_keep_on_death && api->version >= 12) apply("keep the party when a guest dies", kGuestDeath);
     // The Beckoning Bell's Insight is its goods row's consumeHeroPoint (the
     // Souls games' humanity): 0 once the table has loaded.
     if (g_free_bells) {
@@ -639,6 +739,7 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
             g_keep_room = nullptr;
         }
         if (g_following > 0) --g_following;
+        guest_death_frame();
         if (g_reinsert_wait > 0 && --g_reinsert_wait == 0 && !reinsert() && --g_reinsert_tries > 0)
             g_reinsert_wait = 60;  // again in a second
         chan::poll(on_message);
