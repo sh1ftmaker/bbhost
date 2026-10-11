@@ -518,6 +518,24 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
             g.log("seamless: lamp travel to %d after the host: %s", rp, r == 0 ? "queued" : "refused");
         }
         if (g.api->version >= 12) status_line();
+        // The party as this world holds it: members, and which of them have
+        // a character here (the channel and the game's sync need one).
+        static std::uint32_t seen_frame;
+        static int seen_peers = -1, seen_chars = -1;
+        if (++seen_frame % 60 == 0) {
+            const chan::Session s = chan::session();
+            int peers = 0, chars = 0;
+            if (s.mgr && (s.role == 3 || s.role == 6))
+                chan::for_each_peer(s, [&](std::uint8_t* route) {
+                    ++peers;
+                    if (chan::player_of(route)) ++chars;
+                });
+            if (peers != seen_peers || chars != seen_chars) {
+                g.log("seamless: party: %d other member%s, %d with a character here", peers, peers == 1 ? "" : "s", chars);
+                seen_peers = peers;
+                seen_chars = chars;
+            }
+        }
         static std::uint32_t frame, pings;
         if (ping && ++frame % 120 == 0) {
             ++pings;
