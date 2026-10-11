@@ -326,6 +326,16 @@ constexpr std::uint64_t kWarpBonfire = 0x172e050;
 const std::uint8_t kWarpBonfirePrologue[14] = {0x55, 0x48, 0x89, 0xe5, 0x48, 0x63, 0xc6,
                                                0x48, 0x69, 0xc8, 0x89, 0xb5, 0xf8, 0x14};
 std::int32_t g_follow_to = 0;  // a lamp the host went to, for this guest to follow
+int g_following = 0;  // frames left in which this guest's own world transition is the follow
+
+// SessionWorldTransition (0x17cde30) leaves the room with BeginLeaveSession
+// unless GameStateMan (pointer at 0x5956678) +0x1592 is set - as it is on a
+// host, whose transitions keep the room. A following guest's transition is
+// made to keep it the same way: the byte is set for that call and put back
+// at the next frame.
+constexpr std::uint64_t kGameStateManPtr = 0x5956678;
+std::uint8_t* g_keep_room = nullptr;  // the byte while set for a follow
+std::uint8_t g_keep_room_was = 0;
 
 int on_warp_bonfire(BbHookCtx* ctx, void*) {
     const auto rp = static_cast<std::int32_t>(ctx->arg[1]);
@@ -372,6 +382,25 @@ const std::uint8_t kWorldTransitionPrologue[14] = {0x55, 0x48, 0x89, 0xe5, 0x41,
 std::uint64_t caller_bn(const BbHookCtx* ctx) {
     const std::uint64_t base = g.api->guest_addr(0x400000);
     return base && ctx->ret_addr >= base ? ctx->ret_addr - base + 0x400000 : ctx->ret_addr;
+}
+
+bool g_trace = false;
+
+int on_world_transition(BbHookCtx* ctx, void*) {
+    const chan::Session s = chan::session();
+    if (g_following && s.mgr && s.role == 6) {
+        if (std::uint8_t* gsm = chan::deref(kGameStateManPtr)) {
+            g_keep_room = gsm + 0x1592;
+            g_keep_room_was = *g_keep_room;
+            *g_keep_room = 1;
+            g_following = 0;
+            g.log("seamless: following the host: this load keeps the room");
+        }
+    }
+    if (g_trace)
+        g.log("seamless: trace: SessionWorldTransition from 0x%llx (role %d, session state %d)",
+              static_cast<unsigned long long>(caller_bn(ctx)), s.role, s.wsom ? chan::at<std::int32_t>(s.wsom, 0x84) : -1);
+    return 0;
 }
 
 int trace_hook(BbHookCtx* ctx, void* what) {
@@ -475,11 +504,17 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
         return e && e[0] == '1';
     }();
     g.every_frame([] {
+        if (g_keep_room) {
+            *g_keep_room = g_keep_room_was;
+            g_keep_room = nullptr;
+        }
+        if (g_following > 0) --g_following;
         chan::poll(on_message);
         if (g_follow_to) {
             const std::int32_t rp = g_follow_to;
             g_follow_to = 0;
             const int r = g.api->lamp_warp(rp);
+            if (r == 0) g_following = 300;
             g.log("seamless: lamp travel to %d after the host: %s", rp, r == 0 ? "queued" : "refused");
         }
         if (g.api->version >= 12) status_line();
@@ -493,15 +528,15 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
     if (api->version >= 12) {
         api->on_session(on_session, nullptr);
         const char* t = std::getenv("BBHOST_SEAMLESS_TRACE");
-        if (t && t[0] == '1') {
-            if (api->hook2(kBeginLeaveSession, kBeginLeavePrologue, sizeof kBeginLeavePrologue, trace_hook,
-                           const_cast<char*>("BeginLeaveSession")) != 0)
-                g.log("seamless: trace: BeginLeaveSession has other bytes");
-            if (api->hook2(kSessionWorldTransition, kWorldTransitionPrologue, sizeof kWorldTransitionPrologue, trace_hook,
-                           const_cast<char*>("SessionWorldTransition")) != 0)
-                g.log("seamless: trace: SessionWorldTransition has other bytes");
-        }
+        g_trace = t && t[0] == '1';
+        if (g_trace && api->hook2(kBeginLeaveSession, kBeginLeavePrologue, sizeof kBeginLeavePrologue, trace_hook,
+                                  const_cast<char*>("BeginLeaveSession")) != 0)
+            g.log("seamless: trace: BeginLeaveSession has other bytes");
     }
+    if ((g_follow || g_trace) && api->hook2(kSessionWorldTransition, kWorldTransitionPrologue, sizeof kWorldTransitionPrologue,
+                                            on_world_transition, nullptr) != 0)
+        g.log("seamless: the world transition at 0x%llx has other bytes; a following guest leaves the room",
+              static_cast<unsigned long long>(kSessionWorldTransition));
     if (g_follow && api->hook2(kWarpBonfire, kWarpBonfirePrologue, sizeof kWarpBonfirePrologue, on_warp_bonfire, nullptr) != 0)
         g.log("seamless: the lamp travel at 0x%llx has other bytes; guests will not follow",
               static_cast<unsigned long long>(kWarpBonfire));

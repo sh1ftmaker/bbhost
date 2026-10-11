@@ -51,6 +51,7 @@ static int g_goods_logged = 0;
 static double g_reload_after = 0, g_others_since = 0, g_reload_at = 0;
 static int g_reload_done = 0, g_others = -1, g_result_done = 0;
 static char g_gate[512];
+static double g_hold = 75;
 static char g_session[64];
 
 /* The session as SprjSessionManager (pointer at 0x5940290) holds it: its
@@ -155,14 +156,18 @@ static void on_frame(void* user) {
                 api->log("coop_lamp: session: %s (block %08x)", sess, (unsigned)block);
                 strcpy(g_session, sess);
             }
-            if (g_reload_done && !g_result_done && t - g_reload_at > 10) {
+            /* After the load: the session must stay up COOP_HOLD seconds
+             * (default 75 - past the game's later checks and its 60 s join
+             * sync); losing it at any point after 10 s is a failure. */
+            if (g_reload_done && !g_result_done && t - g_reload_at > 10 && members < 2) {
+                g_result_done = 1;
+                api->log("coop_lamp: RESULT the session did not survive the load: %s, %.0f s after it", sess, t - g_reload_at);
+            }
+            if (g_reload_done && !g_result_done && t - g_reload_at > g_hold) {
                 if (members >= 2) {
                     g_result_done = 1;
                     api->log("coop_lamp: RESULT the session survived the load: %s, %.0f s after the reload", sess,
                              t - g_reload_at);
-                } else if (t - g_reload_at > 60) {
-                    g_result_done = 1;
-                    api->log("coop_lamp: RESULT the session did not survive the load: %s", sess);
                 }
             }
             const int others = members > 1 ? members - 1 : 0;
@@ -226,6 +231,7 @@ BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* a) {
     if ((e = getenv("COOP_BELL_SPEFFECT")) && *e) g_bell_sp = atoi(e);
     if ((e = getenv("COOP_BELL_AT")) && *e) g_bell_at = atof(e);
     if ((e = getenv("COOP_RELOAD_AFTER")) && *e) g_reload_after = atof(e);
+    if ((e = getenv("COOP_HOLD")) && *e) g_hold = atof(e);
     if ((e = getenv("COOP_BELL_GATE")) && *e) snprintf(g_gate, sizeof g_gate, "%s", e);
     a->on_frame(on_frame, 0);
     a->log("coop_lamp: loaded (return point %d, bell goods %d speffect %d at %.0f s)", (int)g_rp, g_bell_goods,
