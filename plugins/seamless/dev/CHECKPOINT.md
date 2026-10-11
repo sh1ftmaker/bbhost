@@ -97,3 +97,30 @@ powershell -ExecutionPolicy Bypass -File pair.ps1 -Seamless -KeepRunning -Second
   - A run takes about 2.5 minutes (it was 7). The join comes about 40 s after the guest's sign.
   - Command: `pair.ps1 -Seamless -Ping -ReloadAfter 15 -HostOnlyReload -MinCommitGB 8.5`
 - **The test plugin** (`coop_lamp`) logs the session role and member count from SprjSessionManager, and after any load it logs whether the session is still on.
+
+## Update (2026-10-11): M1 solved - the party survives the host's lamp travel
+
+- **Work lives on branch `seamless/integration`** (worktree `Bloodborne/wt-integration`, pushed to the fork). It holds upstream master + the API branches (`api/hook-ret-addr`, `api/overlay-text`, `api/session-events`) + the plugin.
+- **Building:**
+  - bbhost builds locally: MSYS2 UCRT64 + `win-deps`, run `tools/win_build_msys2.sh` with `WIN_DEPS_ROOT=/c/Users/shift/Desktop/Bloodborne/win-deps`.
+  - The test exe goes in `coop-test/bbhost-int/bbhost.exe` (copy it from `wt-integration/build-win`).
+  - Plugin build: `clang++ ... -Iinclude ... plugins/seamless/seamless.cpp` in wt-integration, output to `coop-test/build/seamless.dll`.
+- **The fix, three parts, all in seamless.cpp:**
+  1. **Guest follows the host.** The guest gets the host's lamp over the channel and travels there too (`lamp_warp`).
+  2. **The guest's travel keeps the room.** The plugin sets GameStateMan(ptr 0x5956678)+0x1592 for the guest's SessionWorldTransition only, and restores it the next frame. Without it, the inline BeginLeaveSession at 0x17cdef6 takes the guest out of the room.
+  3. **The characters come back.**
+     - During the session the plugin skips DestroyAllTasks (0x2254830) when it's called from the unload (return 0x1d4720c).
+     - 10 s after the load, each CSMultiPlayerInsTask (CSMultiPlayMan ptr 0x5940230, vector +0x10..+0x18) whose player has no character is rewound to Create (+0x50/+0x54 = 4, +0xed |= 0x0d).
+     - Notes are in `re/reinsert/reinsert.md`.
+- **Verified 4/4 runs:**
+  - role 3/6 and 2 members held 75 s after the load;
+  - world session state 4;
+  - each side makes the other's character again;
+  - channel pings resume.
+- **Command:** `pair.ps1 -Bbhost <bbhost-int exe> -Seamless -Ping -ReloadAfter 15 -HostOnlyReload -MinCommitGB 8.5` (add `-Trace` for the leave trace).
+- **Not yet checked:**
+  - The guest is visually at the host's lamp; the guest renders minimally, so this needs a screenshot or `-GuestRenders`.
+  - A second lamp travel in a row.
+  - The lamp prompt for the host while in a session (shadp2p's +0x49 gate).
+  - Travel to and from the Hunter's Dream.
+- **Next:** M2 (auto re-summon as a safety net), M3 (boss and host death in game), the Dream (M5/M5b), and the join UX with the new server features.
