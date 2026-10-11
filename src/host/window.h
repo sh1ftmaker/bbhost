@@ -118,6 +118,12 @@ void host_mouse_set_visible(bool visible);
 // A line of text over the game for `seconds` (plugins' show_message); a new
 // one replaces the last. Any thread.
 void host_message_show(const char* text, float seconds);
+// Plugins' own text over the game (overlay_text): `text` at (x, y) in the
+// game's picture, 0-1 from its top left, placed by bbhost_plugin.h's BB_TEXT_*
+// flags, for `seconds` (0 or less: until replaced), in place of the text with
+// that id; empty text removes it. False when 256 are up. Any thread.
+bool host_text_show(std::uint32_t id, const char* text, float x, float y, std::uint32_t rgba, float seconds,
+                    std::uint32_t flags);
 // Text entry for the game's IME dialog: while active the window collects
 // typed text in a box over the game, and the box owns the input - the game
 // sees a connected pad with nothing pressed and no pointer, as a PS4 game
