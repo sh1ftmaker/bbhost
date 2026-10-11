@@ -457,6 +457,60 @@ void status_line() {
     g.api->overlay_text(kStatusText, line, 0.01f, 0.01f, 0xd8c8a0ffu, 2.0f, 0);
 }
 
+// ---- The other players' characters through a load --------------------------
+// Each other player's character is made by a CSMultiPlayerInsTask (one per
+// route, in CSMultiPlayMan's task vector: pointer 0x5940230, +0x10..+0x18)
+// when they join: Init -> ... -> Create (0x2250090: WorldChrMan's
+// CreateRemotePlayer) -> CreateWait -> Update. A map unload deletes every
+// task (the area payload's destructor calls DestroyAllTasks 0x2254830, its
+// return at 0x1d4720c), and nothing makes them again, since the member is
+// still in the room. So during a session the tasks are kept, and after the
+// load each one whose player has no character here is sent back to Create.
+constexpr std::uint64_t kDestroyAllTasks = 0x2254830;
+const std::uint8_t kDestroyAllTasksPrologue[14] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41,
+                                                   0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50};
+constexpr std::uint64_t kDestroyAllTasksFromUnload = 0x1d4720c;
+constexpr std::uint64_t kMultiPlayManPtr = 0x5940230;
+constexpr int kTaskStepUpdate = 6, kTaskStepCreate = 4;
+int g_reinsert_wait = 0;  // frames until the kept tasks are sent back to Create (0: nothing to do)
+
+int on_destroy_all_tasks(BbHookCtx* ctx, void*) {
+    const std::uint64_t base = g.api->guest_addr(0x400000);
+    const std::uint64_t from = base && ctx->ret_addr >= base ? ctx->ret_addr - base + 0x400000 : 0;
+    const chan::Session s = chan::session();
+    if (from != kDestroyAllTasksFromUnload || !s.ready()) return 0;
+    g_reinsert_wait = 600;  // ten seconds after the load starts
+    g.log("seamless: a load in the session: the other players' tasks are kept");
+    return 1;
+}
+
+// The kept tasks whose player has no character here, back to Create
+// (flags +0xed: 0x01 create requested, 0x04 member ready, 0x08 first sync).
+void reinsert() {
+    const chan::Session s = chan::session();
+    std::uint8_t* wcm = chan::deref(chan::kWorldChrManPtr);
+    std::uint8_t* mpm = chan::deref(kMultiPlayManPtr);
+    if (!s.ready() || !wcm || !chan::at<std::uint8_t*>(wcm, 0x60) || !mpm) return;
+    std::uint8_t** it = chan::at<std::uint8_t**>(mpm, 0x10);
+    std::uint8_t** end = chan::at<std::uint8_t**>(mpm, 0x18);
+    int sent = 0;
+    chan::for_each_peer(s, [&](std::uint8_t* route) {
+        if (chan::player_of(route)) return;
+        for (std::uint8_t** t = it; t && t < end; ++t) {
+            std::uint8_t* task = *t;
+            if (!task || !(chan::call(chan::kRouteMatches, chan::u(task + 0xc8), chan::u(route)) & 0xff)) continue;
+            const int mode = chan::at<std::int32_t>(task, 0xe8), step = chan::at<std::int32_t>(task, 0x50);
+            g.log("seamless: task for a member: mode %d, step %d, flags 0x%02x", mode, step, chan::at<std::uint8_t>(task, 0xed));
+            if ((mode != 1 && mode != 2) || step != kTaskStepUpdate) continue;
+            chan::at<std::uint8_t>(task, 0xed) |= 0x0d;
+            chan::at<std::int32_t>(task, 0x54) = kTaskStepCreate;
+            chan::at<std::int32_t>(task, 0x50) = kTaskStepCreate;
+            ++sent;
+        }
+    });
+    g.log("seamless: after the load: %d character%s to make again", sent, sent == 1 ? "" : "s");
+}
+
 void read_options() {
     g_free_bells = option("free_bells", true);
     g_anywhere = option("anywhere", true);
@@ -509,6 +563,7 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
             g_keep_room = nullptr;
         }
         if (g_following > 0) --g_following;
+        if (g_reinsert_wait > 0 && --g_reinsert_wait == 0) reinsert();
         chan::poll(on_message);
         if (g_follow_to) {
             const std::int32_t rp = g_follow_to;
@@ -551,6 +606,10 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
                                   const_cast<char*>("BeginLeaveSession")) != 0)
             g.log("seamless: trace: BeginLeaveSession has other bytes");
     }
+    if (g_keep_on_load && api->version >= 12 &&
+        api->hook2(kDestroyAllTasks, kDestroyAllTasksPrologue, sizeof kDestroyAllTasksPrologue, on_destroy_all_tasks, nullptr) != 0)
+        g.log("seamless: DestroyAllTasks at 0x%llx has other bytes; the other players vanish at a load",
+              static_cast<unsigned long long>(kDestroyAllTasks));
     if ((g_follow || g_trace) && api->hook2(kSessionWorldTransition, kWorldTransitionPrologue, sizeof kWorldTransitionPrologue,
                                             on_world_transition, nullptr) != 0)
         g.log("seamless: the world transition at 0x%llx has other bytes; a following guest leaves the room",
